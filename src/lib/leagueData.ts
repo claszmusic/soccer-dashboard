@@ -8,12 +8,6 @@ export type MatchCell = {
   c?: number;
 };
 
-export type TeamRow = {
-  teamId: number;
-  teamName: string;
-  cellsByDate: Record<string, MatchCell>;
-};
-
 export type LeagueBoard = {
   leagueTitle: string;
   season: number;
@@ -25,23 +19,17 @@ export type LeagueBoard = {
   }>;
 };
 
-async function resolveLeagueId(leagueName: string, country: string, season: number) {
+async function resolveLeague(leagueName: string, country: string, season: number) {
   const trySeason = async (s: number) => {
     const data = await apiFootball<{
-      response: Array<{ league: { id: number; name: string }; country: { name: string } }>;
+      response: Array<{ league: { id: number }; country: { name: string } }>;
     }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
 
-    const id = data.response?.[0]?.league?.id;
-    return id ?? null;
+    const id = data.response?.[0]?.league?.id ?? null;
+    return id ? { leagueId: id, seasonUsed: s } : null;
   };
 
-  const idNow = await trySeason(season);
-  if (idNow) return idNow;
-
-  const idPrev = await trySeason(season - 1);
-  if (idPrev) return idPrev;
-
-  throw new Error(`Could not find league id for ${leagueName} (${country}) season ${season}`);
+  return (await trySeason(season)) || (await trySeason(season - 1)) || null;
 }
 
 function monthDayLabel(dateISO: string) {
@@ -61,22 +49,31 @@ export async function buildLeagueBoard(opts: {
 }): Promise<LeagueBoard> {
   const { leagueName, country, season, columns = 7 } = opts;
 
-  const leagueId = await resolveLeagueId(leagueName, country, season);
+  const resolved = await resolveLeague(leagueName, country, season);
+  if (!resolved) {
+    // Don’t crash the whole site—return an empty board
+    return { leagueTitle: leagueName, season, dateColumns: [], rows: [] };
+  }
 
+  const { leagueId, seasonUsed } = resolved;
+
+  // 1) Teams (use seasonUsed!)
   const teams = await apiFootball<{
     response: Array<{ team: { id: number; name: string } }>;
-  }>("/teams", { league: leagueId, season }, 60 * 60 * 24);
+  }>("/teams", { league: leagueId, season: seasonUsed }, 60 * 60 * 24);
 
   const teamList = teams.response.map((t) => ({ id: t.team.id, name: t.team.name }));
 
-  const leagueFix = await apiFootball<{
+  // 2) Date columns
+  // Try finished games first
+  const finished = await apiFootball<{
     response: Array<{ fixture: { id: number; date: string } }>;
-  }>("/fixtures", { league: leagueId, season, status: "FT", last: 250 }, 60 * 60 * 6);
+  }>("/fixtures", { league: leagueId, season: seasonUsed, status: "FT", last: 250 }, 60 * 60 * 6);
 
   const dateColumns: string[] = [];
   const seen = new Set<string>();
 
-  for (const fx of leagueFix.response) {
+  for (const fx of finished.response) {
     const label = monthDayLabel(fx.fixture.date);
     if (seen.has(label)) continue;
     seen.add(label);
@@ -84,27 +81,50 @@ export async function buildLeagueBoard(opts: {
     if (dateColumns.length >= columns) break;
   }
 
+  // If no finished games yet, use upcoming games so you still see dates + teams
+  if (dateColumns.length === 0) {
+    const upcoming = await apiFootball<{
+      response: Array<{ fixture: { id: number; date: string } }>;
+    }>("/fixtures", { league: leagueId, season: seasonUsed, next: 50 }, 60 * 60 * 6);
+
+    for (const fx of upcoming.response) {
+      const label = monthDayLabel(fx.fixture.date);
+      if (seen.has(label)) continue;
+      seen.add(label);
+      dateColumns.push(label);
+      if (dateColumns.length >= columns) break;
+    }
+  }
+
   const rows: LeagueBoard["rows"] = [];
 
   for (const team of teamList) {
     const fixtures = await apiFootball<{
       response: Array<{
-        fixture: { id: number; date: string };
+        fixture: { id: number; date: string; status: { short: string } };
         goals: { home: number | null; away: number | null };
         teams: { home: { id: number }; away: { id: number } };
       }>;
-    }>("/fixtures", { league: leagueId, season, team: team.id, last: 40 }, 60 * 60 * 6);
+    }>("/fixtures", { league: leagueId, season: seasonUsed, team: team.id, last: 40 }, 60 * 60 * 6);
 
-    const byDate: Record<string, { fixtureId: number; dateLabel: string; goalsFor: number }> = {};
+    const byDate: Record<
+      string,
+      { fixtureId: number; dateLabel: string; goalsFor: number; status: string }
+    > = {};
 
     for (const fx of fixtures.response) {
       const dateLabel = monthDayLabel(fx.fixture.date);
+      if (!dateColumns.includes(dateLabel)) continue;
+
       const isHome = fx.teams.home.id === team.id;
       const goalsFor = isHome ? (fx.goals.home ?? 0) : (fx.goals.away ?? 0);
 
-      if (!dateColumns.includes(dateLabel)) continue;
-
-      byDate[dateLabel] = { fixtureId: fx.fixture.id, dateLabel, goalsFor };
+      byDate[dateLabel] = {
+        fixtureId: fx.fixture.id,
+        dateLabel,
+        goalsFor,
+        status: fx.fixture.status.short,
+      };
     }
 
     const cells: MatchCell[] = [];
@@ -113,6 +133,13 @@ export async function buildLeagueBoard(opts: {
       const fx = byDate[d];
       if (!fx) {
         cells.push({ dateLabel: d });
+        continue;
+      }
+
+      // Only fetch corners/cards if finished (stats often missing for not-finished)
+      const isFinished = fx.status === "FT" || fx.status === "AET" || fx.status === "PEN";
+      if (!isFinished) {
+        cells.push({ fixtureId: fx.fixtureId, dateLabel: d, g: fx.goalsFor });
         continue;
       }
 
@@ -132,25 +159,15 @@ export async function buildLeagueBoard(opts: {
       const ck = typeof corners === "number" ? corners : undefined;
       const c = yellows + reds;
 
-      cells.push({
-        fixtureId: fx.fixtureId,
-        dateLabel: d,
-        ck,
-        g: fx.goalsFor,
-        c,
-      });
+      cells.push({ fixtureId: fx.fixtureId, dateLabel: d, ck, g: fx.goalsFor, c });
     }
 
-    rows.push({
-      teamId: team.id,
-      teamName: team.name,
-      cells,
-    });
+    rows.push({ teamId: team.id, teamName: team.name, cells });
   }
 
   return {
     leagueTitle: leagueName,
-    season,
+    season: seasonUsed,
     dateColumns,
     rows,
   };
