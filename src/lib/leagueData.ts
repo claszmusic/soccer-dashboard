@@ -1,16 +1,13 @@
 // src/lib/leagueData.ts
-// STABLE "ALWAYS LAST 7" VERSION (with ID + NAME fallback matching)
+// Stable last-7 matches per team across season boundaries, with robust team-name + team-id fixing.
 //
-// Fixes the last remaining issue you see (ex: Tigres row blank while Tigres appears in other rows)
-// by matching fixtures to teams using:
-// 1) teamId match (preferred)
-// 2) normalized team name match (fallback)
-//
-// Also:
-// - cache: "no-store" (prevents Vercel/Next caching partial API results)
-// - league fixtures fetched across current + previous season
-// - per-team fallback without season if still empty
-// - corners/cards failures never drop the match card
+// Key fixes:
+// - Fetch league fixtures for season + (season-1), merge, sort newest -> oldest
+// - Build alias mapping from fixtures to resolve "effectiveTeamId" when /teams IDs don't match fixture IDs
+// - Match fixtures by: effectiveTeamId OR original teamId OR fuzzy name match
+// - Team fallback fetch tries BOTH IDs (original + effective) without season to prevent blanks
+// - Corners/cards cached 24h so they don't disappear on refresh
+// - Fixtures/teams/leagues remain no-store to avoid Vercel caching partial payloads
 
 export type MatchCard = {
   fixtureId: number;
@@ -111,25 +108,54 @@ function sumNumbers(values: Array<number | null>): number | null {
   return values.reduce((acc, v) => acc + (v ?? 0), 0);
 }
 
-function normName(s: string) {
-  return (s ?? "")
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "") // strip accents
-    .replace(/[^a-z0-9]+/g, " ") // non-alnum -> space
-    .trim();
-}
-
 function sortByDateDesc<T extends { fixture: { date: string } }>(arr: T[]): T[] {
   return arr
     .slice()
     .sort((a, b) => (a.fixture.date < b.fixture.date ? 1 : a.fixture.date > b.fixture.date ? -1 : 0));
 }
 
-// ---------------- API fetch (NO CACHE) + retry ----------------
+// Normalize name for robust matching (accents/punctuation/spacing)
+function normName(s: string) {
+  return (s ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function tokens(s: string) {
+  const t = normName(s).split(" ").filter(Boolean);
+  return new Set(t);
+}
+
+// Fuzzy name match: exact, contains, or high token overlap
+function nameMatches(a: string, b: string) {
+  const A = normName(a);
+  const B = normName(b);
+  if (!A || !B) return false;
+  if (A === B) return true;
+  if (A.includes(B) || B.includes(A)) return true;
+
+  const ta = tokens(A);
+  const tb = tokens(B);
+  if (!ta.size || !tb.size) return false;
+
+  let common = 0;
+  for (const x of ta) if (tb.has(x)) common++;
+
+  const overlapA = common / ta.size;
+  const overlapB = common / tb.size;
+
+  // allow fairly forgiving overlap (club names can be long)
+  return overlapA >= 0.6 || overlapB >= 0.6;
+}
+
+// ---------------- API fetch (supports cached stats/events) ----------------
 async function apiFetch<T>(
   path: string,
-  params: Record<string, string | number | boolean | undefined> = {}
+  params: Record<string, string | number | boolean | undefined> = {},
+  fetchOpts?: { cacheMode?: RequestCache; revalidateSeconds?: number }
 ): Promise<{ ok: true; data: T } | { ok: false; error: string; status?: number }> {
   const apiKey =
     process.env.APISPORTS_KEY ||
@@ -140,12 +166,16 @@ async function apiFetch<T>(
 
   const url = `${API_BASE}${path}${toQS(params)}`;
 
+  const cacheMode = fetchOpts?.cacheMode ?? "no-store";
+  const revalidateSeconds = fetchOpts?.revalidateSeconds;
+
   const maxAttempts = 7;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const r = await fetch(url, {
         headers: { "x-apisports-key": apiKey },
-        cache: "no-store",
+        cache: cacheMode,
+        ...(revalidateSeconds !== undefined ? { next: { revalidate: revalidateSeconds } } : {}),
       });
 
       if (r.status === 429) {
@@ -210,7 +240,7 @@ type ApiEventsResp = {
 
 // ---------------- core fetchers ----------------
 async function getCurrentSeason(leagueId: number): Promise<number | null> {
-  const r = await apiFetch<ApiLeaguesResp>("/leagues", { id: leagueId });
+  const r = await apiFetch<ApiLeaguesResp>("/leagues", { id: leagueId }, { cacheMode: "no-store" });
   if (!r.ok) return null;
 
   const seasons = r.data.response?.[0]?.seasons ?? [];
@@ -218,7 +248,11 @@ async function getCurrentSeason(leagueId: number): Promise<number | null> {
 }
 
 async function getTeamsForLeague(leagueId: number, season: number): Promise<TeamBoard[] | null> {
-  const r = await apiFetch<ApiTeamsResp>("/teams", { league: leagueId, season });
+  const r = await apiFetch<ApiTeamsResp>(
+    "/teams",
+    { league: leagueId, season },
+    { cacheMode: "no-store" }
+  );
   if (!r.ok) return null;
 
   return (r.data.response ?? []).map((x) => ({
@@ -229,39 +263,49 @@ async function getTeamsForLeague(leagueId: number, season: number): Promise<Team
   }));
 }
 
+// Fixtures across current + previous season, merged + deduped by fixtureId
 async function getLeagueFinishedFixturesAcrossSeasons(leagueId: number, season: number) {
   const seasonsToTry = [season, season - 1];
   const all: ApiFixturesResp["response"] = [];
 
   for (const s of seasonsToTry) {
-    const r = await apiFetch<ApiFixturesResp>("/fixtures", {
-      league: leagueId,
-      season: s,
-      last: 1000,
-    });
+    const r = await apiFetch<ApiFixturesResp>(
+      "/fixtures",
+      { league: leagueId, season: s, last: 1000 },
+      { cacheMode: "no-store" }
+    );
     if (!r.ok) continue;
 
     const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
     all.push(...finished);
   }
 
-  // Dedup by fixtureId
   const byId = new Map<number, ApiFixturesResp["response"][number]>();
   for (const fx of all) byId.set(fx.fixture.id, fx);
 
   return sortByDateDesc(Array.from(byId.values()));
 }
 
+// Team fallback without season; we will call it with multiple ids if needed
 async function getTeamFinishedFixturesNoSeason(teamId: number) {
-  const r = await apiFetch<ApiFixturesResp>("/fixtures", { team: teamId, last: 80 });
+  const r = await apiFetch<ApiFixturesResp>(
+    "/fixtures",
+    { team: teamId, last: 90 },
+    { cacheMode: "no-store" }
+  );
   if (!r.ok) return [];
 
   const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
   return finished.slice(0, 7);
 }
 
+// Corners cached 24h (so they don't disappear)
 async function getCornersTotal(fixtureId: number): Promise<number | null> {
-  const r = await apiFetch<ApiFixtureStatsResp>("/fixtures/statistics", { fixture: fixtureId });
+  const r = await apiFetch<ApiFixtureStatsResp>(
+    "/fixtures/statistics",
+    { fixture: fixtureId },
+    { cacheMode: "force-cache", revalidateSeconds: 24 * 60 * 60 }
+  );
   if (!r.ok) return null;
 
   const rows = r.data.response ?? [];
@@ -275,8 +319,13 @@ async function getCornersTotal(fixtureId: number): Promise<number | null> {
   return sumNumbers(cornerVals);
 }
 
+// Cards cached 24h (so they don't disappear)
 async function getCardsTotal(fixtureId: number): Promise<number | null> {
-  const r = await apiFetch<ApiEventsResp>("/fixtures/events", { fixture: fixtureId });
+  const r = await apiFetch<ApiEventsResp>(
+    "/fixtures/events",
+    { fixture: fixtureId },
+    { cacheMode: "force-cache", revalidateSeconds: 24 * 60 * 60 }
+  );
   if (!r.ok) return null;
 
   const events = r.data.response ?? [];
@@ -308,15 +357,79 @@ async function retryNullable<T>(
   return null;
 }
 
-// Match fixtures to team: ID first, then name fallback
-function teamInFixture(team: TeamBoard, fx: ApiFixturesResp["response"][number]) {
-  if (fx.teams.home.id === team.teamId || fx.teams.away.id === team.teamId) return true;
+// Build alias map: teamName -> set(ids found in fixtures)
+function buildFixtureAliasIndex(leagueFixtures: ApiFixturesResp["response"]) {
+  const nameToIds = new Map<string, Set<number>>();
 
-  const tn = normName(team.name);
-  const hn = normName(fx.teams.home.name);
-  const an = normName(fx.teams.away.name);
+  function add(name: string, id: number) {
+    const n = normName(name);
+    if (!n) return;
+    const set = nameToIds.get(n) ?? new Set<number>();
+    set.add(id);
+    nameToIds.set(n, set);
+  }
 
-  return tn === hn || tn === an;
+  for (const fx of leagueFixtures) {
+    add(fx.teams.home.name, fx.teams.home.id);
+    add(fx.teams.away.name, fx.teams.away.id);
+  }
+
+  return nameToIds;
+}
+
+// Resolve effective team IDs for each team:
+// - start with original teamId
+// - if fixtures show same team name (or close match) with another id, include it
+function resolveEffectiveIds(
+  team: TeamBoard,
+  aliasIndex: Map<string, Set<number>>
+): number[] {
+  const ids = new Set<number>([team.teamId]);
+
+  const teamNameNorm = normName(team.name);
+
+  // Exact normalized key hit
+  const exact = aliasIndex.get(teamNameNorm);
+  if (exact) for (const id of exact) ids.add(id);
+
+  // Fuzzy scan (only if exact didn't find anything)
+  if (!exact || exact.size === 0) {
+    for (const [fxNameNorm, idSet] of aliasIndex.entries()) {
+      if (nameMatches(teamNameNorm, fxNameNorm)) {
+        for (const id of idSet) ids.add(id);
+      }
+    }
+  }
+
+  return Array.from(ids);
+}
+
+// Match fixture to team using ids OR name fallback
+function teamInFixture(
+  team: TeamBoard,
+  effectiveIds: number[],
+  fx: ApiFixturesResp["response"][number]
+) {
+  if (effectiveIds.includes(fx.teams.home.id) || effectiveIds.includes(fx.teams.away.id)) return true;
+
+  // name fallback
+  return (
+    nameMatches(team.name, fx.teams.home.name) ||
+    nameMatches(team.name, fx.teams.away.name)
+  );
+}
+
+// Determine isHome reliably: prefer id match, fallback to name
+function computeIsHome(team: TeamBoard, effectiveIds: number[], fx: ApiFixturesResp["response"][number]) {
+  if (effectiveIds.includes(fx.teams.home.id)) return true;
+  if (effectiveIds.includes(fx.teams.away.id)) return false;
+
+  // fallback: name match
+  if (nameMatches(team.name, fx.teams.home.name)) return true;
+  if (nameMatches(team.name, fx.teams.away.name)) return false;
+
+  // last resort
+  return true;
 }
 
 // ---------------- exported ----------------
@@ -350,20 +463,39 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
     }
 
     const leagueFinished = await getLeagueFinishedFixturesAcrossSeasons(league.leagueId, season);
+    const aliasIndex = buildFixtureAliasIndex(leagueFinished);
 
-    // 1) Build last-7 fixtures per team using ID+NAME matching
+    // Resolve effective IDs per team (this is what fixes “some teams blank”)
+    const teamEffectiveIds = new Map<number, number[]>(); // key: original teamId
+    for (const t of teams) {
+      teamEffectiveIds.set(t.teamId, resolveEffectiveIds(t, aliasIndex));
+    }
+
+    // For each team: pick last 7 from league list using effective IDs; if empty -> fallback try both IDs
     const perTeamFixtures = await Promise.all(
       teams.map(async (t) => {
-        const fromLeague = leagueFinished.filter((fx) => teamInFixture(t, fx)).slice(0, 7);
-        if (fromLeague.length > 0) return { team: t, fixtures: fromLeague };
+        const ids = teamEffectiveIds.get(t.teamId) ?? [t.teamId];
 
-        // Fallback if still empty (no-season)
-        const fallback = await getTeamFinishedFixturesNoSeason(t.teamId);
-        return { team: t, fixtures: fallback };
+        const fromLeague = leagueFinished.filter((fx) => teamInFixture(t, ids, fx)).slice(0, 7);
+        if (fromLeague.length > 0) return { team: t, effectiveIds: ids, fixtures: fromLeague };
+
+        // fallback: try all ids (original + any resolved from fixtures)
+        const merged: ApiFixturesResp["response"] = [];
+        for (const id of ids) {
+          const f = await getTeamFinishedFixturesNoSeason(id);
+          merged.push(...f);
+        }
+
+        // dedup by fixtureId and sort newest->oldest
+        const byId = new Map<number, ApiFixturesResp["response"][number]>();
+        for (const fx of merged) byId.set(fx.fixture.id, fx);
+
+        const sorted = sortByDateDesc(Array.from(byId.values())).slice(0, 7);
+        return { team: t, effectiveIds: ids, fixtures: sorted };
       })
     );
 
-    // 2) Dedup fixtures we actually show for stats/events
+    // Dedup fixture IDs for stats/events
     const fixtureIdsSet = new Set<number>();
     for (const tf of perTeamFixtures) {
       for (const fx of tf.fixtures) fixtureIdsSet.add(fx.fixture.id);
@@ -375,7 +507,7 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
     await Promise.all(
       fixtureIds.map((fixtureId) =>
         fxLimiter(async () => {
-          await sleep(120);
+          await sleep(80);
           const cornersTotal = await retryNullable(() => getCornersTotal(fixtureId), 3, 650);
           const cardsTotal = await retryNullable(() => getCardsTotal(fixtureId), 3, 650);
           fixtureData.set(fixtureId, { cornersTotal, cardsTotal });
@@ -383,16 +515,13 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       )
     );
 
-    // 3) Map into match cards, always 7
-    const filledTeams: TeamBoard[] = perTeamFixtures.map(({ team, fixtures }) => {
+    // Build TeamBoards (always 7 matches)
+    const filledTeams: TeamBoard[] = perTeamFixtures.map(({ team, effectiveIds, fixtures }) => {
       const real: MatchCard[] = fixtures.map((fx) => {
         const fixtureId = fx.fixture.id;
         const date = fx.fixture.date;
 
-        const isHome = normName(fx.teams.home.name) === normName(team.name)
-          ? true
-          : fx.teams.home.id === team.teamId;
-
+        const isHome = computeIsHome(team, effectiveIds, fx);
         const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
 
         const homeGoals = fx.goals.home ?? 0;
@@ -417,21 +546,14 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       return { ...team, matches };
     });
 
-    // If a team still has 0 real fixtures, surface a helpful note
-    const zeros = filledTeams.filter((t) => t.matches.every((m) => m.fixtureId === 0)).length;
-
     out.push({
       leagueId: league.leagueId,
       leagueName: league.leagueName,
       seasonUsed: season,
       teams: filledTeams,
-      error:
-        zeros > 0
-          ? `Some teams returned 0 fixtures from API (showing blanks): ${zeros}. This is usually API throttling/partial data. Refresh later.`
-          : undefined,
     });
 
-    await sleep(250);
+    await sleep(200);
   }
 
   return out;
