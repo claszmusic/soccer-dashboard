@@ -11,15 +11,17 @@ type ApiTeamsResp = {
   response: { team: { id: number; name: string; logo: string } }[];
 };
 
+type FixtureRow = {
+  fixture: { id: number; date: string; status?: { short?: string } };
+  teams: {
+    home: { id: number; name: string };
+    away: { id: number; name: string };
+  };
+  goals: { home: number | null; away: number | null };
+};
+
 type ApiLeagueFixturesResp = {
-  response: {
-    fixture: { id: number; date: string; status?: { short?: string } };
-    teams: {
-      home: { id: number; name: string };
-      away: { id: number; name: string };
-    };
-    goals: { home: number | null; away: number | null };
-  }[];
+  response: FixtureRow[];
 };
 
 type ApiFixtureStatsResp = {
@@ -37,10 +39,10 @@ export type MatchRow = {
   opponent: string;
   isHome: boolean;
 
-  // YOU WANT COMBINED TOTALS:
-  goalsTotal: number;            // home+away
-  cornersTotal: number | null;   // home+away (null if unavailable / rate-limited)
-  cardsTotal: number | null;     // (yellow+red) home+away (null if unavailable / rate-limited)
+  // combined totals
+  goalsTotal: number;            // home + away
+  cornersTotal: number | null;   // home + away
+  cardsTotal: number | null;     // (yellow+red) home + away
 };
 
 export type TeamRow = {
@@ -71,11 +73,7 @@ function statToNumber(v: number | string | null | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function getTeamStat(
-  stats: ApiFixtureStatsResp["response"],
-  teamId: number,
-  type: string
-): number {
+function getTeamStat(stats: ApiFixtureStatsResp["response"], teamId: number, type: string): number {
   const block = stats.find((x) => x.team.id === teamId);
   if (!block) return 0;
   const s = block.statistics.find((x) => x.type === type);
@@ -106,21 +104,19 @@ async function mapLimit<T, R>(
   return results;
 }
 
-/* ---------------- API CALLS ---------------- */
+/* ---------------- STATS FETCH ---------------- */
 
-// In-memory cache for this request run (helps a lot)
+// Cache per request
 const fixtureStatsCache = new Map<number, ApiFixtureStatsResp | null>();
 
 async function getFixtureStatsWithRetry(fixtureId: number): Promise<ApiFixtureStatsResp | null> {
   if (fixtureStatsCache.has(fixtureId)) return fixtureStatsCache.get(fixtureId)!;
 
-  // 429 happens even on paid plans if you burst.
-  // We'll go slow + retry.
-  const maxTries = 4;
+  const maxTries = 8;
 
   for (let attempt = 1; attempt <= maxTries; attempt++) {
-    // slow down between calls (burst control)
-    await sleep(250);
+    // slow down (burst control)
+    await sleep(600);
 
     const r = await apiGet<ApiFixtureStatsResp>(
       "/fixtures/statistics",
@@ -134,22 +130,29 @@ async function getFixtureStatsWithRetry(fixtureId: number): Promise<ApiFixtureSt
     }
 
     const err = pickError(r);
-    const isRate = err.toLowerCase().includes("rate") || err.toLowerCase().includes("too many");
+    const msg = err.toLowerCase();
+    const isRate =
+      msg.includes("rate") ||
+      msg.includes("too many") ||
+      msg.includes("exceeded");
 
-    // If it's rate limit, backoff and retry
+    // If rate-limited, back off and try again (do NOT cache null yet)
     if (isRate && attempt < maxTries) {
-      await sleep(600 * attempt);
+      await sleep(900 * attempt);
       continue;
     }
 
-    // For ANY failure, do not break the whole page. Just mark stats missing.
+    // Non-rate error: cache null and stop
     fixtureStatsCache.set(fixtureId, null);
     return null;
   }
 
+  // After max tries, cache null (prevents infinite loops in one request)
   fixtureStatsCache.set(fixtureId, null);
   return null;
 }
+
+/* ---------------- API CALLS ---------------- */
 
 async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
   const r = await apiGet<ApiLeagueResp>("/leagues", { id: leagueId }, { noStore: true });
@@ -168,12 +171,27 @@ async function getTeams(leagueId: number, season: number): Promise<ApiResult<Api
   return apiGet<ApiTeamsResp>("/teams", { league: leagueId, season }, { noStore: true });
 }
 
-async function getRecentLeagueFixtures(leagueId: number, season: number): Promise<ApiResult<ApiLeagueFixturesResp>> {
-  // ✅ Key optimization: ONE call per league instead of one per team.
-  // Increase last if you notice some teams don’t get 7 finished games.
+async function getRecentLeagueFixtures(
+  leagueId: number,
+  season: number
+): Promise<ApiResult<ApiLeagueFixturesResp>> {
+  // BIGGER PULL so every team can get 7
   return apiGet<ApiLeagueFixturesResp>(
     "/fixtures",
-    { league: leagueId, season, status: "FT", last: 300 },
+    { league: leagueId, season, status: "FT", last: 1000 },
+    { noStore: true }
+  );
+}
+
+async function getRecentTeamFixtures(
+  leagueId: number,
+  season: number,
+  teamId: number
+): Promise<ApiResult<ApiLeagueFixturesResp>> {
+  // Fallback ONLY for teams missing matches
+  return apiGet<ApiLeagueFixturesResp>(
+    "/fixtures",
+    { league: leagueId, season, team: teamId, status: "FT", last: 20 },
     { noStore: true }
   );
 }
@@ -191,38 +209,25 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
     return { leagueId: league.id, leagueName: league.name, teams: [], error: pickError(seasonRes) };
   }
 
-  const teamsRes = await getTeams(league.id, seasonRes.data);
+  const season = seasonRes.data;
+
+  const teamsRes = await getTeams(league.id, season);
   if (!teamsRes.ok) {
-    return {
-      leagueId: league.id,
-      leagueName: league.name,
-      seasonUsed: seasonRes.data,
-      teams: [],
-      error: pickError(teamsRes),
-    };
+    return { leagueId: league.id, leagueName: league.name, seasonUsed: season, teams: [], error: pickError(teamsRes) };
   }
 
-  const fxRes = await getRecentLeagueFixtures(league.id, seasonRes.data);
+  const fxRes = await getRecentLeagueFixtures(league.id, season);
   if (!fxRes.ok) {
-    return {
-      leagueId: league.id,
-      leagueName: league.name,
-      seasonUsed: seasonRes.data,
-      teams: [],
-      error: pickError(fxRes),
-    };
+    return { leagueId: league.id, leagueName: league.name, seasonUsed: season, teams: [], error: pickError(fxRes) };
   }
 
   const allFixtures = (fxRes.data.response ?? []).slice();
-
-  // sort newest first
   allFixtures.sort((a, b) => (a.fixture.date < b.fixture.date ? 1 : -1));
 
   const teams = teamsRes.data.response ?? [];
 
-  // Pick last 7 per team from league fixtures (home or away)
-  const teamMatches = new Map<number, ApiLeagueFixturesResp["response"][0][]>();
-
+  // last 7 per team (from league fixtures)
+  const teamMatches = new Map<number, FixtureRow[]>();
   for (const t of teams) teamMatches.set(t.team.id, []);
 
   for (const f of allFixtures) {
@@ -236,7 +241,33 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
     if (aList && aList.length < 7) aList.push(f);
   }
 
-  // Stats only for UNIQUE fixtures that are actually displayed
+  // ✅ Fallback: any team still missing matches gets a team-specific pull
+  const missing = teams
+    .map((t) => t.team.id)
+    .filter((id) => (teamMatches.get(id)?.length ?? 0) < 7);
+
+  if (missing.length > 0) {
+    // Do these sequentially to avoid spikes
+    for (const teamId of missing) {
+      const r = await getRecentTeamFixtures(league.id, season, teamId);
+      if (!r.ok) continue;
+
+      const list = (r.data.response ?? []).slice().sort((a, b) => (a.fixture.date < b.fixture.date ? 1 : -1));
+
+      const picked: FixtureRow[] = [];
+      for (const f of list) {
+        const isInThisTeam = f.teams.home.id === teamId || f.teams.away.id === teamId;
+        if (!isInThisTeam) continue;
+        picked.push(f);
+        if (picked.length >= 7) break;
+      }
+
+      teamMatches.set(teamId, picked);
+      await sleep(250);
+    }
+  }
+
+  // Gather UNIQUE fixtures shown
   const neededFixtureIds = new Set<number>();
   for (const list of teamMatches.values()) {
     for (const f of list) neededFixtureIds.add(f.fixture.id);
@@ -244,7 +275,7 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
 
   const uniqueIds = Array.from(neededFixtureIds);
 
-  // Slow stats calls to avoid 429 (limit=1 is intentional)
+  // Fetch stats slowly (limit=1) so rateLimit stops happening
   await mapLimit(uniqueIds, 1, async (id) => {
     await getFixtureStatsWithRetry(id);
     return null;
@@ -300,12 +331,10 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
     };
   });
 
-  // IMPORTANT: We do NOT fail the league just because stats were rate-limited.
-  // Goals will still show, CK/C will be "-" until stats succeed.
   return {
     leagueId: league.id,
     leagueName: league.name,
-    seasonUsed: seasonRes.data,
+    seasonUsed: season,
     teams: rows,
   };
 }
