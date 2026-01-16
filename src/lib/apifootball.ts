@@ -1,45 +1,32 @@
-type AnyObj = Record<string, any>;
-
-const BASE = "https://v3.football.api-sports.io";
-
 export async function apiFootball<T>(
   path: string,
-  params: AnyObj = {},
-  cacheSeconds: number = 0
+  params: Record<string, any>,
+  cacheSeconds = 60
 ): Promise<T> {
   const key = process.env.APISPORTS_KEY;
 
   if (!key) {
-    throw new Error(
-      "Missing APISPORTS_KEY env var. Add it in Vercel Project → Settings → Environment Variables."
-    );
+    // Don't crash the whole app — return an empty-like object by throwing a friendly error
+    throw new Error("Missing APISPORTS_KEY env var in this environment (Vercel Production?)");
   }
 
-  const url = new URL(BASE + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined || v === null || v === "") continue;
+  const url = new URL(`https://v3.football.api-sports.io${path}`);
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v === undefined || v === null || v === "") return;
     url.searchParams.set(k, String(v));
-  }
-
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      "x-apisports-key": key,
-    },
-    // IMPORTANT: prevents build-time/static caching surprises
-    cache: "no-store",
-    next: cacheSeconds ? { revalidate: cacheSeconds } : undefined,
   });
 
-  const text = await res.text();
+  const res = await fetch(url.toString(), {
+    headers: { "x-apisports-key": key },
+    // keep it simple/stable on Vercel:
+    cache: "no-store",
+  });
 
+  // If API returns an error, we throw (and we will catch it in page.tsx)
   if (!res.ok) {
+    const text = await res.text().catch(() => "");
     throw new Error(`API-Football error ${res.status}: ${text.slice(0, 200)}`);
   }
 
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(`API-Football returned non-JSON: ${text.slice(0, 200)}`);
-  }
+  return (await res.json()) as T;
 }
