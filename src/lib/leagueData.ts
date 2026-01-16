@@ -1,5 +1,5 @@
 // src/lib/leagueData.ts
-import { apiGet, ApiResult } from "./apiFootball";
+import { apiGet } from "./apifootball";
 import { LEAGUES, type LeagueConfig } from "./leagues";
 
 type ApiLeagueResp = {
