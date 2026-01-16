@@ -4,7 +4,7 @@ This project displays a dashboard for:
 - Bundesliga
 - Premier League
 - Serie A  
-- Liga MX 
+- Liga MX  
 - La Liga
 
 Each row is a team. Columns are the latest 7 match dates in that league.
