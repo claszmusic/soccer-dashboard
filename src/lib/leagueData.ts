@@ -1,5 +1,13 @@
 // src/lib/leagueData.ts
-type MatchCard = {
+// SofaScore (unofficial JSON) backend for last 7 finished matches per team
+// Totals:
+// - goalsTotal = home + away
+// - cornersTotal = home + away
+// - cardsTotal = (yellow + red) home + away
+//
+// NOTE: These are unofficial endpoints and may change.
+
+export type MatchRow = {
   fixtureId: number;
   date: string;
   opponent: string;
@@ -9,30 +17,34 @@ type MatchCard = {
   cardsTotal: number;
 };
 
-type TeamBoard = {
+export type TeamBlock = {
   teamId: number;
   name: string;
   logo: string;
-  matches: MatchCard[];
+  matches: MatchRow[];
 };
 
-type LeagueBoard = {
+export type LeagueBlock = {
   leagueId: number;
   leagueName: string;
   seasonUsed?: number;
   error?: string;
-  teams: TeamBoard[];
+  teams: TeamBlock[];
 };
 
-type GetBoardArgs = {
-  leagues: { leagueId: number; leagueName: string }[];
+export type LeagueBoard = {
+  ok: boolean;
+  data: LeagueBlock[];
+  error?: string;
 };
-
-type Ok<T> = { ok: true; data: T };
-type Err = { ok: false; error: string };
 
 const SOFA_BASE = "https://api.sofascore.com/api/v1";
 const IMG_TEAM = "https://img.sofascore.com/api/v1/team";
+const DAY_SECONDS = 60 * 60 * 24;
+
+function buildTeamLogo(teamId: number) {
+  return `${IMG_TEAM}/${teamId}/image`;
+}
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -40,28 +52,24 @@ function sleep(ms: number) {
 
 async function fetchJson<T>(
   url: string,
-  opts?: {
-    revalidateSeconds?: number;
-    tries?: number;
-    delayMs?: number;
-  }
+  opts?: { cache24h?: boolean; tries?: number; delayMs?: number }
 ): Promise<T> {
   const tries = opts?.tries ?? 3;
-  const delayMs = opts?.delayMs ?? 400;
+  const delayMs = opts?.delayMs ?? 350;
 
   let lastErr: any = null;
 
   for (let i = 0; i < tries; i++) {
     try {
       const res = await fetch(url, {
-        // cache rules:
-        // - dynamic league/team lists: no-store
-        // - per-event stats/incidents: revalidate ~24h
-        cache: opts?.revalidateSeconds ? "force-cache" : "no-store",
-        next: opts?.revalidateSeconds ? { revalidate: opts.revalidateSeconds } : undefined,
+        cache: opts?.cache24h ? "force-cache" : "no-store",
+        next: opts?.cache24h ? { revalidate: DAY_SECONDS } : undefined,
         headers: {
+          // These headers matter: SofaScore often blocks “empty” serverless requests.
           "user-agent": "Mozilla/5.0",
           accept: "application/json,text/plain,*/*",
+          "accept-language": "en-US,en;q=0.9",
+          referer: "https://www.sofascore.com/",
         },
       });
 
@@ -80,185 +88,209 @@ async function fetchJson<T>(
   throw lastErr ?? new Error("fetch failed");
 }
 
-/**
- * Get "latest" seasonId for a tournament.
- * Unofficial API shape, but generally returns { seasons: [...] } with "year"/"id".
- */
-async function getLatestSeasonId(uniqueTournamentId: number): Promise<{ seasonId: number; seasonName?: string }> {
-  const j = await fetchJson<any>(`${SOFA_BASE}/unique-tournament/${uniqueTournamentId}/seasons`, {
-    tries: 3,
-    delayMs: 350,
-  });
+// ---------- helpers ----------
+function num(v: any): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 
+function safeDateISO(ev: any): string {
+  const ts = Number(ev?.startTimestamp);
+  if (Number.isFinite(ts) && ts > 0) return new Date(ts * 1000).toISOString();
+  if (ev?.startDate) return new Date(ev.startDate).toISOString();
+  return new Date().toISOString();
+}
+
+function goalsTotalFromEvent(ev: any): number {
+  const h = num(ev?.homeScore?.current);
+  const a = num(ev?.awayScore?.current);
+  return h + a;
+}
+
+function opponentFromEvent(ev: any, teamId: number): { name: string; isHome: boolean } {
+  const homeId = num(ev?.homeTeam?.id);
+  const awayId = num(ev?.awayTeam?.id);
+  const isHome = homeId === teamId;
+  const opp = isHome ? ev?.awayTeam?.name : ev?.homeTeam?.name;
+  return { name: String(opp ?? "-"), isHome };
+}
+
+function statusType(ev: any): string {
+  // usually: ev.status.type === "finished"
+  const t = ev?.status?.type ?? ev?.status;
+  return String(t ?? "").toLowerCase();
+}
+
+// ---------- core endpoints ----------
+async function getLatestSeasonId(uniqueTournamentId: number): Promise<number> {
+  const j = await fetchJson<any>(`${SOFA_BASE}/unique-tournament/${uniqueTournamentId}/seasons`);
   const seasons: any[] = Array.isArray(j?.seasons) ? j.seasons : [];
   if (!seasons.length) throw new Error(`No seasons for tournament ${uniqueTournamentId}`);
 
-  // pick the greatest "year" if present, else last element
-  const sorted = [...seasons].sort((a, b) => (b?.year ?? 0) - (a?.year ?? 0));
+  const sorted = [...seasons].sort((a, b) => num(b?.year) - num(a?.year));
   const pick = sorted[0] ?? seasons[seasons.length - 1];
-
   if (!pick?.id) throw new Error(`Bad seasons payload for tournament ${uniqueTournamentId}`);
-
-  return { seasonId: Number(pick.id), seasonName: pick?.name };
+  return num(pick.id);
 }
 
-/**
- * League standings -> list of teams (id + name)
- */
-async function getTeamsFromStandings(uniqueTournamentId: number, seasonId: number): Promise<Array<{ id: number; name: string }>> {
-  // common endpoint pattern used by sofascore internal API
-  const j = await fetchJson<any>(`${SOFA_BASE}/unique-tournament/${uniqueTournamentId}/season/${seasonId}/standings/total`, {
-    tries: 3,
-    delayMs: 350,
-  });
+async function getTeamsFromStandings(uniqueTournamentId: number, seasonId: number) {
+  const j = await fetchJson<any>(
+    `${SOFA_BASE}/unique-tournament/${uniqueTournamentId}/season/${seasonId}/standings/total`
+  );
 
-  // shape usually: { standings: [ { rows: [ { team: { id, name } } ] } ] }
   const standings = Array.isArray(j?.standings) ? j.standings : [];
   const rows = Array.isArray(standings?.[0]?.rows) ? standings[0].rows : [];
 
   const teams = rows
     .map((r: any) => r?.team)
     .filter(Boolean)
-    .map((t: any) => ({ id: Number(t.id), name: String(t.name ?? "Unknown") }))
-    .filter((t: any) => Number.isFinite(t.id));
+    .map((t: any) => ({ id: num(t.id), name: String(t.name ?? "Unknown") }))
+    .filter((t: any) => t.id > 0);
 
-  // de-dupe
   const seen = new Set<number>();
   return teams.filter((t) => (seen.has(t.id) ? false : (seen.add(t.id), true)));
 }
 
-/**
- * Team events -> last finished events; returns event ids
- * Endpoint noted in public writeups: /api/v1/team/{team_id}/events/last/{page} :contentReference[oaicite:7]{index=7}
- */
 async function getLastFinishedEvents(teamId: number, need: number): Promise<any[]> {
   const out: any[] = [];
-  for (let page = 0; page < 5 && out.length < need; page++) {
-    const j = await fetchJson<any>(`${SOFA_BASE}/team/${teamId}/events/last/${page}`, { tries: 3, delayMs: 350 });
+  for (let page = 0; page < 6 && out.length < need; page++) {
+    const j = await fetchJson<any>(`${SOFA_BASE}/team/${teamId}/events/last/${page}`, {
+      tries: 3,
+      delayMs: 400,
+    });
     const events: any[] = Array.isArray(j?.events) ? j.events : [];
 
     for (const ev of events) {
-      const status = ev?.status?.type || ev?.status;
-      // typical: "finished" / "inprogress" / "notstarted"
-      if (String(status).toLowerCase() === "finished") out.push(ev);
+      const st = statusType(ev);
+      if (st === "finished") out.push(ev);
       if (out.length >= need) break;
     }
   }
   return out.slice(0, need);
 }
 
-/**
- * Event stats: corners
- * We look for a stat item named "Corner kicks" (or similar) and sum home+away.
- * Stats are cached 24h because they don't change after FT.
- */
+// ---------- stats parsing ----------
+function flattenStatItems(statsJson: any): any[] {
+  const blocks: any[] = Array.isArray(statsJson?.statistics) ? statsJson.statistics : [];
+  const all = blocks.find((b) => String(b?.period).toUpperCase() === "ALL") ?? blocks[0];
+  const groups: any[] = Array.isArray(all?.groups) ? all.groups : [];
+  const items = groups.flatMap((g) => (Array.isArray(g?.statisticsItems) ? g.statisticsItems : []));
+  return items;
+}
+
+function findStat(items: any[], predicate: (it: any) => boolean) {
+  return items.find(predicate);
+}
+
 async function getCornersTotal(eventId: number): Promise<number> {
   try {
     const j = await fetchJson<any>(`${SOFA_BASE}/event/${eventId}/statistics`, {
-      revalidateSeconds: 60 * 60 * 24,
+      cache24h: true,
       tries: 3,
-      delayMs: 350,
+      delayMs: 450,
     });
 
-    // Typical structure: { statistics: [ { period: "ALL", groups: [ { groupName, statisticsItems: [...] } ] } ] }
-    const blocks: any[] = Array.isArray(j?.statistics) ? j.statistics : [];
-    const all = blocks.find((b) => String(b?.period).toUpperCase() === "ALL") ?? blocks[0];
-    const groups: any[] = Array.isArray(all?.groups) ? all.groups : [];
+    const items = flattenStatItems(j);
 
-    const items = groups.flatMap((g) => (Array.isArray(g?.statisticsItems) ? g.statisticsItems : []));
+    // match by name OR key (both exist depending on event)
     const cornerItem =
-      items.find((it: any) => String(it?.name).toLowerCase() === "corner kicks") ??
-      items.find((it: any) => String(it?.name).toLowerCase().includes("corner"));
+      findStat(items, (it) => String(it?.name ?? "").toLowerCase() === "corner kicks") ||
+      findStat(items, (it) => String(it?.name ?? "").toLowerCase() === "corners") ||
+      findStat(items, (it) => String(it?.key ?? "").toLowerCase() === "corners") ||
+      findStat(items, (it) => String(it?.name ?? "").toLowerCase().includes("corner"));
 
-    const home = Number(cornerItem?.home ?? cornerItem?.homeValue ?? 0) || 0;
-    const away = Number(cornerItem?.away ?? cornerItem?.awayValue ?? 0) || 0;
-
+    const home = num(cornerItem?.home ?? cornerItem?.homeValue);
+    const away = num(cornerItem?.away ?? cornerItem?.awayValue);
     return home + away;
   } catch {
     return 0;
   }
 }
 
-/**
- * Event incidents: cards
- * Incidents cached 24h after FT.
- */
+async function getCardsTotalFromStatistics(eventId: number): Promise<number | null> {
+  try {
+    const j = await fetchJson<any>(`${SOFA_BASE}/event/${eventId}/statistics`, {
+      cache24h: true,
+      tries: 3,
+      delayMs: 450,
+    });
+
+    const items = flattenStatItems(j);
+
+    const yellow =
+      findStat(items, (it) => String(it?.name ?? "").toLowerCase() === "yellow cards") ||
+      findStat(items, (it) => String(it?.key ?? "").toLowerCase() === "yellowCards".toLowerCase());
+
+    const red =
+      findStat(items, (it) => String(it?.name ?? "").toLowerCase() === "red cards") ||
+      findStat(items, (it) => String(it?.key ?? "").toLowerCase() === "redCards".toLowerCase());
+
+    // If neither exists, stats payload might not include card counts
+    if (!yellow && !red) return null;
+
+    const yHome = num(yellow?.home ?? yellow?.homeValue);
+    const yAway = num(yellow?.away ?? yellow?.awayValue);
+    const rHome = num(red?.home ?? red?.homeValue);
+    const rAway = num(red?.away ?? red?.awayValue);
+
+    return yHome + yAway + rHome + rAway;
+  } catch {
+    return null;
+  }
+}
+
 async function getCardsTotal(eventId: number): Promise<number> {
+  // Prefer statistics (stable, clean)
+  const fromStats = await getCardsTotalFromStatistics(eventId);
+  if (fromStats !== null) return fromStats;
+
+  // Fallback: incidents (naming varies)
   try {
     const j = await fetchJson<any>(`${SOFA_BASE}/event/${eventId}/incidents`, {
-      revalidateSeconds: 60 * 60 * 24,
+      cache24h: true,
       tries: 3,
-      delayMs: 350,
+      delayMs: 450,
     });
 
     const inc: any[] = Array.isArray(j?.incidents) ? j.incidents : [];
-
-    // Count both yellow + red. (Google shows them separately; you want total.)
-    // incidentType values vary; we check for "yellow"/"red" in the string.
     let total = 0;
+
     for (const x of inc) {
       const t = String(x?.incidentType ?? x?.type ?? "").toLowerCase();
-      if (t.includes("yellow") || t.includes("red")) total += 1;
+      // common variations
+      if (t.includes("yellow") || t.includes("red") || t.includes("card")) total += 1;
     }
+
     return total;
   } catch {
     return 0;
   }
 }
 
-function buildTeamLogo(teamId: number) {
-  // stable image endpoint used by sofascore
-  return `${IMG_TEAM}/${teamId}/image`;
-}
-
-function safeDateISO(ev: any): string {
-  // sofascore usually provides startTimestamp (seconds)
-  const ts = Number(ev?.startTimestamp);
-  if (Number.isFinite(ts) && ts > 0) return new Date(ts * 1000).toISOString();
-  // fallback if they provide startDate
-  if (ev?.startDate) return new Date(ev.startDate).toISOString();
-  return new Date().toISOString();
-}
-
-function getGoalsTotalFromEvent(ev: any): number {
-  const home = Number(ev?.homeScore?.current ?? 0) || 0;
-  const away = Number(ev?.awayScore?.current ?? 0) || 0;
-  return home + away;
-}
-
-function opponentName(ev: any, teamId: number): { name: string; isHome: boolean } {
-  const homeId = Number(ev?.homeTeam?.id);
-  const awayId = Number(ev?.awayTeam?.id);
-
-  const isHome = homeId === teamId;
-  const opp = isHome ? ev?.awayTeam?.name : ev?.homeTeam?.name;
-
-  return { name: String(opp ?? "-"), isHome };
-}
-
-/**
- * MAIN exported function used by your route.ts
- */
-export async function getLeagueBoard(args: GetBoardArgs): Promise<Ok<LeagueBoard[]> | Err> {
+// ---------- main ----------
+export async function getLeagueBoard(args: {
+  leagues: Array<{ leagueId: number; leagueName: string }>;
+}): Promise<LeagueBoard> {
   try {
-    const leagues: LeagueBoard[] = [];
+    const blocks: LeagueBlock[] = [];
 
     for (const L of args.leagues) {
       try {
-        const { seasonId } = await getLatestSeasonId(L.leagueId);
+        const seasonId = await getLatestSeasonId(L.leagueId);
         const teams = await getTeamsFromStandings(L.leagueId, seasonId);
 
-        const teamBoards: TeamBoard[] = [];
+        const teamBlocks: TeamBlock[] = [];
 
         for (const t of teams) {
           const events = await getLastFinishedEvents(t.id, 7);
 
-          const matches: MatchCard[] = [];
+          const matches: MatchRow[] = [];
           for (const ev of events) {
-            const eventId = Number(ev?.id);
-            const { name: opp, isHome } = opponentName(ev, t.id);
+            const eventId = num(ev?.id);
+            const { name: opp, isHome } = opponentFromEvent(ev, t.id);
 
-            const goalsTotal = getGoalsTotalFromEvent(ev);
+            // Always numbers
+            const goalsTotal = goalsTotalFromEvent(ev);
             const cornersTotal = await getCornersTotal(eventId);
             const cardsTotal = await getCardsTotal(eventId);
 
@@ -273,7 +305,7 @@ export async function getLeagueBoard(args: GetBoardArgs): Promise<Ok<LeagueBoard
             });
           }
 
-          // Ensure exactly 7 slots (no blanks that crash UI)
+          // If SofaScore returns fewer than 7 finished matches, pad with blanks
           while (matches.length < 7) {
             matches.push({
               fixtureId: 0,
@@ -286,7 +318,7 @@ export async function getLeagueBoard(args: GetBoardArgs): Promise<Ok<LeagueBoard
             });
           }
 
-          teamBoards.push({
+          teamBlocks.push({
             teamId: t.id,
             name: t.name,
             logo: buildTeamLogo(t.id),
@@ -294,14 +326,14 @@ export async function getLeagueBoard(args: GetBoardArgs): Promise<Ok<LeagueBoard
           });
         }
 
-        leagues.push({
+        blocks.push({
           leagueId: L.leagueId,
           leagueName: L.leagueName,
           seasonUsed: seasonId,
-          teams: teamBoards,
+          teams: teamBlocks,
         });
       } catch (e: any) {
-        leagues.push({
+        blocks.push({
           leagueId: L.leagueId,
           leagueName: L.leagueName,
           error: e?.message ?? String(e),
@@ -310,8 +342,8 @@ export async function getLeagueBoard(args: GetBoardArgs): Promise<Ok<LeagueBoard
       }
     }
 
-    return { ok: true, data: leagues };
+    return { ok: true, data: blocks };
   } catch (e: any) {
-    return { ok: false, error: e?.message ?? String(e) };
+    return { ok: false, data: [], error: e?.message ?? String(e) };
   }
 }
