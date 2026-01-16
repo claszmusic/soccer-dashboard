@@ -1,14 +1,8 @@
 // src/lib/leagueData.ts
-// LAST-7 finished matches per team (home+away combined totals).
-//
-// Stabilized fixes:
-// - GLOBAL API limiter to prevent 429/partial empties on Vercel
-// - League fixtures for season + (season-1), dedup + newest->oldest
-// - Team matching by effective IDs + fuzzy name match
-// - If still 0: RESCUE IDs using /teams?search=teamName and retry
-// - Final fallback: /fixtures?team=<id>&last=... without season (sorted)
-// - Corners + cards cached 24h so they don’t disappear across refreshes
-// - teams/fixtures/leagues use no-store to avoid partial Vercel caching
+// Google Sheets CSV backend -> LeagueBoard[]
+// Reads SHEET_CSV_URL (published CSV from Matches sheet)
+// Groups by league/team, sorts by date desc, returns last 7 per team.
+// Stable: no live sports API calls during page load.
 
 export type MatchCard = {
   fixtureId: number;
@@ -23,7 +17,7 @@ export type MatchCard = {
 export type TeamBoard = {
   teamId: number;
   name: string;
-  logo: string;
+  logo: string; // optional; can be blank if not stored
   matches: MatchCard[];
 };
 
@@ -35,57 +29,20 @@ export type LeagueBoard = {
   teams: TeamBoard[];
 };
 
-const LEAGUES: Array<{ leagueId: number; leagueName: string }> = [
-  { leagueId: 262, leagueName: "Liga MX" },
-  { leagueId: 39, leagueName: "Premier League" },
-  { leagueId: 78, leagueName: "Bundesliga" },
-  { leagueId: 140, leagueName: "La Liga" },
-  { leagueId: 135, leagueName: "Serie A" },
-];
-
-const API_BASE = "https://v3.football.api-sports.io";
-const FINISHED = new Set(["FT", "AET", "PEN"]);
-
-// ---------------- utils ----------------
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function toQS(params: Record<string, string | number | boolean | undefined>) {
-  const usp = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined) continue;
-    usp.set(k, String(v));
-  }
-  const s = usp.toString();
-  return s ? `?${s}` : "";
-}
-
-function createLimiter(concurrency: number) {
-  let active = 0;
-  const queue: Array<() => void> = [];
-
-  const next = () => {
-    active--;
-    const fn = queue.shift();
-    if (fn) fn();
-  };
-
-  return async function limit<T>(fn: () => Promise<T>): Promise<T> {
-    if (active >= concurrency) {
-      await new Promise<void>((resolve) => queue.push(resolve));
-    }
-    active++;
-    try {
-      return await fn();
-    } finally {
-      next();
-    }
-  };
-}
-
-// ✅ Global limiter prevents API-Football 429/partial empties
-const apiLimit = createLimiter(3);
+type CsvRow = {
+  leagueId: number;
+  leagueName: string;
+  teamId: number;
+  teamName: string;
+  fixtureId: number;
+  date: string;
+  opponent: string;
+  isHome: boolean;
+  goalsTotal: number | null;
+  cornersTotal: number | null;
+  cardsTotal: number | null;
+  // logo not in your sheet yet; can be added later
+};
 
 function blankMatch(): MatchCard {
   return {
@@ -99,480 +56,237 @@ function blankMatch(): MatchCard {
   };
 }
 
-function statNumber(v: number | string | null | undefined): number | null {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  const n = Number(v);
+function safeNum(v: string | undefined): number | null {
+  if (v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
 
-function sumNumbers(values: Array<number | null>): number | null {
-  const any = values.some((x) => x !== null);
-  if (!any) return null;
-  return values.reduce((acc, v) => acc + (v ?? 0), 0);
+function safeInt(v: string | undefined): number {
+  const n = Number(String(v ?? "").trim());
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
 
-function sortByDateDesc<T extends { fixture: { date: string } }>(arr: T[]): T[] {
-  return arr
-    .slice()
-    .sort((a, b) =>
-      a.fixture.date < b.fixture.date ? 1 : a.fixture.date > b.fixture.date ? -1 : 0
-    );
+function safeBool(v: string | undefined): boolean {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes";
 }
 
-function normName(s: string) {
-  return (s ?? "")
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
+// Minimal CSV parser that supports quoted fields with commas/newlines
+function parseCSV(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
 
-function tokens(s: string) {
-  return new Set(normName(s).split(" ").filter(Boolean));
-}
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
 
-function nameMatches(a: string, b: string) {
-  const A = normName(a);
-  const B = normName(b);
-  if (!A || !B) return false;
-  if (A === B) return true;
-  if (A.includes(B) || B.includes(A)) return true;
-
-  const ta = tokens(A);
-  const tb = tokens(B);
-  if (!ta.size || !tb.size) return false;
-
-  let common = 0;
-  for (const x of ta) if (tb.has(x)) common++;
-
-  const overlapA = common / ta.size;
-  const overlapB = common / tb.size;
-
-  return overlapA >= 0.6 || overlapB >= 0.6;
-}
-
-// ---------------- API fetch ----------------
-async function apiFetch<T>(
-  path: string,
-  params: Record<string, string | number | boolean | undefined> = {},
-  fetchOpts?: { cacheMode?: RequestCache; revalidateSeconds?: number }
-): Promise<{ ok: true; data: T } | { ok: false; error: string; status?: number }> {
-  const apiKey =
-    process.env.APISPORTS_KEY ||
-    process.env.APISPORTS_API_KEY ||
-    process.env.APISPORTSKEY;
-
-  if (!apiKey) return { ok: false as const, error: "Missing APISPORTS_KEY env var" };
-
-  const url = `${API_BASE}${path}${toQS(params)}`;
-  const cacheMode = fetchOpts?.cacheMode ?? "no-store";
-  const revalidateSeconds = fetchOpts?.revalidateSeconds;
-
-  const maxAttempts = 7;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const r = await apiLimit(async () => {
-        // small spacing helps a lot on Vercel bursts
-        await sleep(60);
-        return fetch(url, {
-          headers: { "x-apisports-key": apiKey },
-          cache: cacheMode,
-          ...(revalidateSeconds !== undefined ? { next: { revalidate: revalidateSeconds } } : {}),
-        });
-      });
-
-      if (r.status === 429) {
-        const wait = Math.min(20000, 900 * Math.pow(2, attempt - 1));
-        await sleep(wait);
-        continue;
+    if (inQuotes) {
+      if (c === '"') {
+        const next = text[i + 1];
+        if (next === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += c;
       }
-
-      if (!r.ok) {
-        const txt = await r.text().catch(() => "");
-        return {
-          ok: false as const,
-          error: `API ${r.status}: ${txt || r.statusText}`,
-          status: r.status,
-        };
-      }
-
-      const json = (await r.json()) as T;
-      return { ok: true as const, data: json };
-    } catch (e: any) {
-      if (attempt === maxAttempts) {
-        return { ok: false as const, error: `Network error: ${e?.message ?? String(e)}` };
-      }
-      await sleep(Math.min(12000, 700 * Math.pow(2, attempt - 1)));
+      continue;
     }
+
+    if (c === '"') {
+      inQuotes = true;
+      continue;
+    }
+
+    if (c === ",") {
+      row.push(field);
+      field = "";
+      continue;
+    }
+
+    if (c === "\r") continue;
+
+    if (c === "\n") {
+      row.push(field);
+      field = "";
+      rows.push(row);
+      row = [];
+      continue;
+    }
+
+    field += c;
   }
 
-  return { ok: false as const, error: "Unknown error" };
+  // last field
+  row.push(field);
+  rows.push(row);
+
+  // drop trailing empty row
+  if (rows.length && rows[rows.length - 1].every((x) => x.trim() === "")) rows.pop();
+
+  return rows;
 }
 
-// ---------------- API types ----------------
-type ApiLeaguesResp = {
-  response: Array<{
-    seasons: Array<{ year: number; current: boolean }>;
-  }>;
-};
+async function fetchSheetCSV(): Promise<{ ok: true; rows: CsvRow[] } | { ok: false; error: string }> {
+  const url = process.env.SHEET_CSV_URL;
+  if (!url) return { ok: false, error: "Missing SHEET_CSV_URL env var in Vercel." };
 
-type ApiTeamsResp = {
-  response: Array<{ team: { id: number; name: string; logo: string } }>;
-};
+  try {
+    const r = await fetch(url, {
+      // Sheets publish endpoint is public; cache helps stability + speed
+      next: { revalidate: 60 }, // refresh up to once per minute
+    });
 
-type ApiTeamsSearchResp = {
-  response: Array<{ team: { id: number; name: string } }>;
-};
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      return { ok: false, error: `CSV fetch failed (${r.status}): ${t || r.statusText}` };
+    }
 
-type ApiFixturesResp = {
-  response: Array<{
-    fixture: { id: number; date: string; status: { short: string } };
-    teams: { home: { id: number; name: string }; away: { id: number; name: string } };
-    goals: { home: number | null; away: number | null };
-  }>;
-};
+    const csvText = await r.text();
+    const table = parseCSV(csvText);
+    if (table.length < 2) return { ok: true, rows: [] };
 
-type ApiFixtureStatsResp = {
-  response: Array<{
-    statistics: Array<{ type: string; value: number | string | null }>;
-  }>;
-};
+    const header = table[0].map((h) => h.trim());
+    const idx = (name: string) => header.indexOf(name);
 
-type ApiEventsResp = {
-  response: Array<{
-    type: string;
-    detail: string;
-  }>;
-};
+    const iLeagueId = idx("leagueId");
+    const iLeagueName = idx("leagueName");
+    const iTeamId = idx("teamId");
+    const iTeamName = idx("teamName");
+    const iFixtureId = idx("fixtureId");
+    const iDate = idx("date");
+    const iOpponent = idx("opponent");
+    const iIsHome = idx("isHome");
+    const iGoalsTotal = idx("goalsTotal");
+    const iCornersTotal = idx("cornersTotal");
+    const iCardsTotal = idx("cardsTotal");
 
-// ---------------- core fetchers ----------------
-async function getCurrentSeason(leagueId: number): Promise<number | null> {
-  const r = await apiFetch<ApiLeaguesResp>("/leagues", { id: leagueId }, { cacheMode: "no-store" });
-  if (!r.ok) return null;
+    const required = [iLeagueId, iLeagueName, iTeamId, iTeamName, iFixtureId, iDate, iOpponent, iIsHome, iGoalsTotal];
+    if (required.some((x) => x === -1)) {
+      return { ok: false, error: "CSV headers do not match expected columns. Re-check your Matches header row." };
+    }
 
-  const seasons = r.data.response?.[0]?.seasons ?? [];
-  return seasons.find((s) => s.current)?.year ?? seasons[0]?.year ?? null;
+    const rows: CsvRow[] = [];
+
+    for (let r = 1; r < table.length; r++) {
+      const line = table[r];
+
+      const leagueId = safeInt(line[iLeagueId]);
+      const leagueName = String(line[iLeagueName] ?? "").trim();
+      const teamId = safeInt(line[iTeamId]);
+      const teamName = String(line[iTeamName] ?? "").trim();
+      const fixtureId = safeInt(line[iFixtureId]);
+      const date = String(line[iDate] ?? "").trim();
+      const opponent = String(line[iOpponent] ?? "").trim();
+      const isHome = safeBool(line[iIsHome]);
+
+      // totals can be blank if script didn’t fill yet
+      const goalsTotal = safeNum(line[iGoalsTotal]);
+      const cornersTotal = iCornersTotal === -1 ? null : safeNum(line[iCornersTotal]);
+      const cardsTotal = iCardsTotal === -1 ? null : safeNum(line[iCardsTotal]);
+
+      if (!leagueId || !teamId || !fixtureId || !date) continue;
+
+      rows.push({
+        leagueId,
+        leagueName,
+        teamId,
+        teamName,
+        fixtureId,
+        date,
+        opponent: opponent || "-",
+        isHome,
+        goalsTotal,
+        cornersTotal,
+        cardsTotal,
+      });
+    }
+
+    return { ok: true, rows };
+  } catch (e: any) {
+    return { ok: false, error: `CSV fetch error: ${e?.message ?? String(e)}` };
+  }
 }
 
-async function getTeamsForLeague(leagueId: number, season: number): Promise<TeamBoard[] | null> {
-  const r = await apiFetch<ApiTeamsResp>("/teams", { league: leagueId, season }, { cacheMode: "no-store" });
-  if (!r.ok) return null;
-
-  return (r.data.response ?? []).map((x) => ({
-    teamId: x.team.id,
-    name: x.team.name,
-    logo: x.team.logo,
-    matches: [],
-  }));
-}
-
-// League fixtures across current + previous season
-async function getLeagueFinishedFixturesAcrossSeasons(leagueId: number, season: number) {
-  const seasonsToTry = [season, season - 1];
-  const all: ApiFixturesResp["response"] = [];
-
-  for (const s of seasonsToTry) {
-    // NOTE: API-Football can behave weird with huge `last`.
-    // 500 is safer and still plenty for last-7 per team.
-    const r = await apiFetch<ApiFixturesResp>(
-      "/fixtures",
-      { league: leagueId, season: s, last: 500 },
-      { cacheMode: "no-store" }
-    );
-    if (!r.ok) continue;
-
-    const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
-    all.push(...finished);
+export async function getLeagueBoards(): Promise<LeagueBoard[]> {
+  const res = await fetchSheetCSV();
+  if (!res.ok) {
+    // return skeleton leagues so UI still renders
+    return [
+      { leagueId: 262, leagueName: "Liga MX", error: res.error, teams: [] },
+      { leagueId: 39, leagueName: "Premier League", error: res.error, teams: [] },
+      { leagueId: 78, leagueName: "Bundesliga", error: res.error, teams: [] },
+      { leagueId: 140, leagueName: "La Liga", error: res.error, teams: [] },
+      { leagueId: 135, leagueName: "Serie A", error: res.error, teams: [] },
+    ];
   }
 
-  const byId = new Map<number, ApiFixturesResp["response"][number]>();
-  for (const fx of all) byId.set(fx.fixture.id, fx);
+  // Group: league -> team -> matches
+  const leagueMap = new Map<number, { leagueId: number; leagueName: string; teamMap: Map<number, TeamBoard> }>();
 
-  return sortByDateDesc(Array.from(byId.values()));
-}
+  // Dedup by team+fixture
+  const seen = new Set<string>();
 
-// Team fixtures without season filter (final fallback)
-async function getTeamFinishedFixturesNoSeason(teamId: number) {
-  const r = await apiFetch<ApiFixturesResp>(
-    "/fixtures",
-    { team: teamId, last: 200 },
-    { cacheMode: "no-store" }
-  );
-  if (!r.ok) return [];
+  for (const row of res.rows) {
+    const key = `${row.teamId}|${row.fixtureId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
 
-  const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
-  return sortByDateDesc(finished).slice(0, 20); // return more, we’ll cut to 7 later
-}
+    let league = leagueMap.get(row.leagueId);
+    if (!league) {
+      league = { leagueId: row.leagueId, leagueName: row.leagueName || `League ${row.leagueId}`, teamMap: new Map() };
+      leagueMap.set(row.leagueId, league);
+    }
 
-// ✅ ID RESCUE: /teams?search=...
-async function searchTeamIdsByName(teamName: string): Promise<number[]> {
-  const q = teamName.trim();
-  if (!q) return [];
+    let team = league.teamMap.get(row.teamId);
+    if (!team) {
+      team = { teamId: row.teamId, name: row.teamName || `Team ${row.teamId}`, logo: "", matches: [] };
+      league.teamMap.set(row.teamId, team);
+    }
 
-  const r = await apiFetch<ApiTeamsSearchResp>("/teams", { search: q }, { cacheMode: "no-store" });
-  if (!r.ok) return [];
-
-  const want = teamName;
-  const out: number[] = [];
-
-  for (const row of r.data.response ?? []) {
-    const gotName = row.team?.name ?? "";
-    if (nameMatches(want, gotName)) out.push(row.team.id);
+    team.matches.push({
+      fixtureId: row.fixtureId,
+      date: row.date,
+      opponent: row.opponent || "-",
+      isHome: row.isHome,
+      goalsTotal: row.goalsTotal,
+      cornersTotal: row.cornersTotal,
+      cardsTotal: row.cardsTotal,
+    });
   }
 
-  if (out.length === 0) {
-    for (const row of (r.data.response ?? []).slice(0, 5)) out.push(row.team.id);
-  }
+  // Build boards with last 7, always 7 slots
+  const boards: LeagueBoard[] = Array.from(leagueMap.values()).map((L) => {
+    const teams = Array.from(L.teamMap.values()).map((t) => {
+      const sorted = t.matches
+        .slice()
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+        .slice(0, 7);
 
-  return Array.from(new Set(out));
-}
+      while (sorted.length < 7) sorted.push(blankMatch());
 
-// Corners cached 24h
-async function getCornersTotal(fixtureId: number): Promise<number | null> {
-  const r = await apiFetch<ApiFixtureStatsResp>(
-    "/fixtures/statistics",
-    { fixture: fixtureId },
-    { cacheMode: "force-cache", revalidateSeconds: 24 * 60 * 60 }
-  );
-  if (!r.ok) return null;
+      return { ...t, matches: sorted };
+    });
 
-  const rows = r.data.response ?? [];
-  if (!rows.length) return null;
+    // sort teams alphabetically for stable UI
+    teams.sort((a, b) => a.name.localeCompare(b.name));
 
-  const cornerVals: Array<number | null> = rows.map((row) => {
-    const v = row.statistics.find((s) => s.type === "Corner Kicks")?.value ?? null;
-    return statNumber(v);
+    return {
+      leagueId: L.leagueId,
+      leagueName: L.leagueName,
+      teams,
+    };
   });
 
-  return sumNumbers(cornerVals);
-}
+  // Keep your preferred league order even if sheet rows are missing
+  const preferredOrder = [262, 39, 78, 140, 135];
+  boards.sort((a, b) => preferredOrder.indexOf(a.leagueId) - preferredOrder.indexOf(b.leagueId));
 
-// Cards cached 24h
-async function getCardsTotal(fixtureId: number): Promise<number | null> {
-  const r = await apiFetch<ApiEventsResp>(
-    "/fixtures/events",
-    { fixture: fixtureId },
-    { cacheMode: "force-cache", revalidateSeconds: 24 * 60 * 60 }
-  );
-  if (!r.ok) return null;
-
-  const events = r.data.response ?? [];
-  if (!events.length) return 0;
-
-  let yellow = 0;
-  let red = 0;
-
-  for (const e of events) {
-    if (e.type !== "Card") continue;
-    const d = (e.detail ?? "").toLowerCase();
-    if (d.includes("yellow")) yellow++;
-    if (d.includes("red")) red++;
-  }
-
-  return yellow + red;
-}
-
-async function retryNullable<T>(
-  fn: () => Promise<T | null>,
-  tries: number,
-  baseWaitMs: number
-): Promise<T | null> {
-  for (let i = 1; i <= tries; i++) {
-    const v = await fn();
-    if (v !== null) return v;
-    if (i < tries) await sleep(baseWaitMs * i);
-  }
-  return null;
-}
-
-// Alias map from fixtures
-function buildFixtureAliasIndex(leagueFixtures: ApiFixturesResp["response"]) {
-  const nameToIds = new Map<string, Set<number>>();
-
-  function add(name: string, id: number) {
-    const n = normName(name);
-    if (!n) return;
-    const set = nameToIds.get(n) ?? new Set<number>();
-    set.add(id);
-    nameToIds.set(n, set);
-  }
-
-  for (const fx of leagueFixtures) {
-    add(fx.teams.home.name, fx.teams.home.id);
-    add(fx.teams.away.name, fx.teams.away.id);
-  }
-
-  return nameToIds;
-}
-
-function resolveEffectiveIds(team: TeamBoard, aliasIndex: Map<string, Set<number>>): number[] {
-  const ids = new Set<number>([team.teamId]);
-  const teamNameNorm = normName(team.name);
-
-  const exact = aliasIndex.get(teamNameNorm);
-  if (exact && exact.size > 0) {
-    for (const id of exact) ids.add(id);
-    return Array.from(ids);
-  }
-
-  for (const [fxNameNorm, idSet] of aliasIndex.entries()) {
-    if (nameMatches(teamNameNorm, fxNameNorm)) {
-      for (const id of idSet) ids.add(id);
-      break;
-    }
-  }
-
-  return Array.from(ids);
-}
-
-function teamInFixture(team: TeamBoard, effectiveIds: number[], fx: ApiFixturesResp["response"][number]) {
-  if (effectiveIds.includes(fx.teams.home.id) || effectiveIds.includes(fx.teams.away.id)) return true;
-  return nameMatches(team.name, fx.teams.home.name) || nameMatches(team.name, fx.teams.away.name);
-}
-
-function computeIsHome(team: TeamBoard, effectiveIds: number[], fx: ApiFixturesResp["response"][number]) {
-  if (effectiveIds.includes(fx.teams.home.id)) return true;
-  if (effectiveIds.includes(fx.teams.away.id)) return false;
-
-  if (nameMatches(team.name, fx.teams.home.name)) return true;
-  if (nameMatches(team.name, fx.teams.away.name)) return false;
-
-  return true;
-}
-
-// ---------------- exported ----------------
-export async function getLeagueBoards(): Promise<LeagueBoard[]> {
-  const statsLimiter = createLimiter(2); // stats/events are heavy
-  const perTeamLimiter = createLimiter(2); // ✅ avoid burst per team fallbacks
-  const out: LeagueBoard[] = [];
-
-  for (const league of LEAGUES) {
-    const season = await getCurrentSeason(league.leagueId);
-    if (!season) {
-      out.push({
-        leagueId: league.leagueId,
-        leagueName: league.leagueName,
-        error: "Could not resolve season.",
-        teams: [],
-      });
-      continue;
-    }
-
-    const teams = await getTeamsForLeague(league.leagueId, season);
-    if (!teams || teams.length === 0) {
-      out.push({
-        leagueId: league.leagueId,
-        leagueName: league.leagueName,
-        seasonUsed: season,
-        error: "Could not load teams.",
-        teams: [],
-      });
-      continue;
-    }
-
-    const leagueFinished = await getLeagueFinishedFixturesAcrossSeasons(league.leagueId, season);
-    const aliasIndex = buildFixtureAliasIndex(leagueFinished);
-
-    const teamEffectiveIds = new Map<number, number[]>();
-    for (const t of teams) teamEffectiveIds.set(t.teamId, resolveEffectiveIds(t, aliasIndex));
-
-    // Build fixtures per team (with throttled fallback)
-    const perTeamFixtures = await Promise.all(
-      teams.map((t) =>
-        perTeamLimiter(async () => {
-          let ids = new Set<number>(teamEffectiveIds.get(t.teamId) ?? [t.teamId]);
-
-          // 1) From league list first (fast, no extra calls)
-          let fromLeague = leagueFinished.filter((fx) => teamInFixture(t, Array.from(ids), fx));
-          fromLeague = sortByDateDesc(fromLeague).slice(0, 7);
-          if (fromLeague.length > 0) return { team: t, effectiveIds: Array.from(ids), fixtures: fromLeague };
-
-          // 2) Try NO-SEASON for only the primary id first (don’t explode calls)
-          let merged: ApiFixturesResp["response"] = [];
-          merged.push(...(await getTeamFinishedFixturesNoSeason(t.teamId)));
-
-          // 3) If empty, do ID RESCUE and retry no-season for rescued IDs
-          if (merged.length === 0) {
-            const rescued = await searchTeamIdsByName(t.name);
-            for (const rid of rescued) ids.add(rid);
-
-            // only try a few ids max
-            const tryIds = Array.from(ids).slice(0, 4);
-            for (const id of tryIds) {
-              merged.push(...(await getTeamFinishedFixturesNoSeason(id)));
-            }
-          }
-
-          // Dedup + sort + take 7
-          const byId = new Map<number, ApiFixturesResp["response"][number]>();
-          for (const fx of merged) byId.set(fx.fixture.id, fx);
-
-          const sorted = sortByDateDesc(Array.from(byId.values())).slice(0, 7);
-          return { team: t, effectiveIds: Array.from(ids), fixtures: sorted };
-        })
-      )
-    );
-
-    // Dedup fixture IDs for stats/events
-    const fixtureIdsSet = new Set<number>();
-    for (const tf of perTeamFixtures) for (const fx of tf.fixtures) fixtureIdsSet.add(fx.fixture.id);
-    const fixtureIds = [...fixtureIdsSet];
-
-    const fixtureData = new Map<number, { cornersTotal: number | null; cardsTotal: number | null }>();
-
-    await Promise.all(
-      fixtureIds.map((fixtureId) =>
-        statsLimiter(async () => {
-          await sleep(90);
-          const cornersTotal = await retryNullable(() => getCornersTotal(fixtureId), 3, 650);
-          const cardsTotal = await retryNullable(() => getCardsTotal(fixtureId), 3, 650);
-          fixtureData.set(fixtureId, { cornersTotal, cardsTotal });
-        })
-      )
-    );
-
-    // Build TeamBoards (always 7 slots)
-    const filledTeams: TeamBoard[] = perTeamFixtures.map(({ team, effectiveIds, fixtures }) => {
-      const real: MatchCard[] = fixtures.map((fx) => {
-        const fixtureId = fx.fixture.id;
-        const date = fx.fixture.date;
-
-        const isHome = computeIsHome(team, effectiveIds, fx);
-        const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
-
-        const homeGoals = fx.goals.home ?? 0;
-        const awayGoals = fx.goals.away ?? 0;
-
-        const d = fixtureData.get(fixtureId) ?? { cornersTotal: null, cardsTotal: null };
-
-        return {
-          fixtureId,
-          date,
-          opponent,
-          isHome,
-          goalsTotal: homeGoals + awayGoals,
-          cornersTotal: d.cornersTotal,
-          cardsTotal: d.cardsTotal,
-        };
-      });
-
-      const matches = real.slice(0, 7);
-      while (matches.length < 7) matches.push(blankMatch());
-
-      return { ...team, matches };
-    });
-
-    out.push({
-      leagueId: league.leagueId,
-      leagueName: league.leagueName,
-      seasonUsed: season,
-      teams: filledTeams,
-    });
-
-    await sleep(250);
-  }
-
-  return out;
+  return boards;
 }
