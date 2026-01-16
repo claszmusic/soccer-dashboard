@@ -19,19 +19,6 @@ export type LeagueBoard = {
   }>;
 };
 
-async function resolveLeague(leagueName: string, country: string, season: number) {
-  const trySeason = async (s: number) => {
-    const data = await apiFootball<{
-      response: Array<{ league: { id: number }; country: { name: string } }>;
-    }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
-
-    const id = data.response?.[0]?.league?.id ?? null;
-    return id ? { leagueId: id, seasonUsed: s } : null;
-  };
-
-  return (await trySeason(season)) || (await trySeason(season - 1)) || null;
-}
-
 function monthDayLabel(dateISO: string) {
   const d = new Date(dateISO);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -39,6 +26,18 @@ function monthDayLabel(dateISO: string) {
 
 function getStatValue(stats: Array<{ type: string; value: number | null }>, type: string) {
   return stats.find((s) => s.type === type)?.value ?? null;
+}
+
+async function resolveLeagueId(leagueName: string, country: string, season: number) {
+  const trySeason = async (s: number) => {
+    const data = await apiFootball<{
+      response: Array<{ league: { id: number }; country: { name: string } }>;
+    }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
+
+    return data.response?.[0]?.league?.id ?? null;
+  };
+
+  return (await trySeason(season)) || (await trySeason(season - 1));
 }
 
 export async function buildLeagueBoard(opts: {
@@ -49,51 +48,28 @@ export async function buildLeagueBoard(opts: {
 }): Promise<LeagueBoard> {
   const { leagueName, country, season, columns = 7 } = opts;
 
-  const resolved = await resolveLeague(leagueName, country, season);
-  if (!resolved) {
-    // Don’t crash the whole site—return an empty board
-    return { leagueTitle: leagueName, season, dateColumns: [], rows: [] };
-  }
+  const leagueId = await resolveLeagueId(leagueName, country, season);
+  if (!leagueId) throw new Error("League ID not found");
 
-  const { leagueId, seasonUsed } = resolved;
-
-  // 1) Teams (use seasonUsed!)
   const teams = await apiFootball<{
     response: Array<{ team: { id: number; name: string } }>;
-  }>("/teams", { league: leagueId, season: seasonUsed }, 60 * 60 * 24);
+  }>("/teams", { league: leagueId, season }, 60 * 60 * 24);
 
   const teamList = teams.response.map((t) => ({ id: t.team.id, name: t.team.name }));
 
-  // 2) Date columns
-  // Try finished games first
-  const finished = await apiFootball<{
+  const leagueFix = await apiFootball<{
     response: Array<{ fixture: { id: number; date: string } }>;
-  }>("/fixtures", { league: leagueId, season: seasonUsed, status: "FT", last: 250 }, 60 * 60 * 6);
+  }>("/fixtures", { league: leagueId, season, status: "FT", last: 250 }, 60 * 60 * 6);
 
   const dateColumns: string[] = [];
   const seen = new Set<string>();
 
-  for (const fx of finished.response) {
+  for (const fx of leagueFix.response) {
     const label = monthDayLabel(fx.fixture.date);
     if (seen.has(label)) continue;
     seen.add(label);
     dateColumns.push(label);
     if (dateColumns.length >= columns) break;
-  }
-
-  // If no finished games yet, use upcoming games so you still see dates + teams
-  if (dateColumns.length === 0) {
-    const upcoming = await apiFootball<{
-      response: Array<{ fixture: { id: number; date: string } }>;
-    }>("/fixtures", { league: leagueId, season: seasonUsed, next: 50 }, 60 * 60 * 6);
-
-    for (const fx of upcoming.response) {
-      const label = monthDayLabel(fx.fixture.date);
-      if (seen.has(label)) continue;
-      seen.add(label);
-      dateColumns.push(label);
-      if (dateColumns.length >= columns) break;
-    }
   }
 
   const rows: LeagueBoard["rows"] = [];
@@ -105,11 +81,11 @@ export async function buildLeagueBoard(opts: {
         goals: { home: number | null; away: number | null };
         teams: { home: { id: number }; away: { id: number } };
       }>;
-    }>("/fixtures", { league: leagueId, season: seasonUsed, team: team.id, last: 40 }, 60 * 60 * 6);
+    }>("/fixtures", { league: leagueId, season, team: team.id, last: 40 }, 60 * 60 * 6);
 
     const byDate: Record<
       string,
-      { fixtureId: number; dateLabel: string; goalsFor: number; status: string }
+      { fixtureId: number; dateLabel: string; goalsFor: number; finished: boolean }
     > = {};
 
     for (const fx of fixtures.response) {
@@ -118,12 +94,13 @@ export async function buildLeagueBoard(opts: {
 
       const isHome = fx.teams.home.id === team.id;
       const goalsFor = isHome ? (fx.goals.home ?? 0) : (fx.goals.away ?? 0);
+      const finished = fx.fixture.status.short === "FT";
 
       byDate[dateLabel] = {
         fixtureId: fx.fixture.id,
         dateLabel,
         goalsFor,
-        status: fx.fixture.status.short,
+        finished,
       };
     }
 
@@ -136,38 +113,56 @@ export async function buildLeagueBoard(opts: {
         continue;
       }
 
-      // Only fetch corners/cards if finished (stats often missing for not-finished)
-      const isFinished = fx.status === "FT" || fx.status === "AET" || fx.status === "PEN";
-      if (!isFinished) {
-        cells.push({ fixtureId: fx.fixtureId, dateLabel: d, g: fx.goalsFor });
+      if (!fx.finished) {
+        cells.push({
+          fixtureId: fx.fixtureId,
+          dateLabel: d,
+          g: fx.goalsFor,
+        });
         continue;
       }
 
-      const stats = await apiFootball<{
-        response: Array<{
-          team: { id: number };
-          statistics: Array<{ type: string; value: number | null }>;
-        }>;
-      }>("/fixtures/statistics", { fixture: fx.fixtureId }, 60 * 60 * 24);
+      let ck: number | undefined = undefined;
+      let c: number | undefined = undefined;
 
-      const teamStats = stats.response.find((s) => s.team.id === team.id)?.statistics ?? [];
+      try {
+        const stats = await apiFootball<{
+          response: Array<{
+            team: { id: number };
+            statistics: Array<{ type: string; value: number | null }>;
+          }>;
+        }>("/fixtures/statistics", { fixture: fx.fixtureId }, 60 * 60 * 24);
 
-      const corners = getStatValue(teamStats, "Corner Kicks");
-      const yellows = getStatValue(teamStats, "Yellow Cards") ?? 0;
-      const reds = getStatValue(teamStats, "Red Cards") ?? 0;
+        const teamStats =
+          stats.response.find((s) => s.team.id === team.id)?.statistics ?? [];
 
-      const ck = typeof corners === "number" ? corners : undefined;
-      const c = yellows + reds;
+        const corners = getStatValue(teamStats, "Corner Kicks");
+        const yellows = getStatValue(teamStats, "Yellow Cards") ?? 0;
+        const reds = getStatValue(teamStats, "Red Cards") ?? 0;
 
-      cells.push({ fixtureId: fx.fixtureId, dateLabel: d, ck, g: fx.goalsFor, c });
+        ck = typeof corners === "number" ? corners : undefined;
+        c = yellows + reds;
+      } catch {}
+
+      cells.push({
+        fixtureId: fx.fixtureId,
+        dateLabel: d,
+        ck,
+        g: fx.goalsFor,
+        c,
+      });
     }
 
-    rows.push({ teamId: team.id, teamName: team.name, cells });
+    rows.push({
+      teamId: team.id,
+      teamName: team.name,
+      cells,
+    });
   }
 
   return {
     leagueTitle: leagueName,
-    season: seasonUsed,
+    season,
     dateColumns,
     rows,
   };
