@@ -60,7 +60,16 @@ export type LeagueBoardData = {
 
 /* ---------------- HELPERS ---------------- */
 
-function getStat(stats: ApiFixturesResp["response"][0]["statistics"], teamId: number, name: string) {
+function pickError(r: ApiResult<any>): string {
+  // Works even if TS refuses to narrow unions
+  return (r && typeof r === "object" && "error" in r ? (r as any).error : "API error") as string;
+}
+
+function getStat(
+  stats: ApiFixturesResp["response"][0]["statistics"] | undefined,
+  teamId: number,
+  name: string
+): number {
   if (!stats) return 0;
   const t = stats.find((s) => s.team.id === teamId);
   if (!t) return 0;
@@ -73,12 +82,13 @@ function getStat(stats: ApiFixturesResp["response"][0]["statistics"], teamId: nu
 async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
   const r = await apiGet<ApiLeagueResp>("/leagues", { id: leagueId }, { noStore: true });
 
-  if (!r.ok) return { ok: false, error: r.error };
+  if (!r.ok) {
+    return { ok: false, error: pickError(r) };
+  }
 
   const seasons = r.data.response?.[0]?.seasons ?? [];
   const current = seasons.find((s) => s.current)?.year;
   const fallback = seasons.map((s) => s.year).sort((a, b) => b - a)[0];
-
   const year = current ?? fallback;
 
   if (!year) return { ok: false, error: `No seasons found for league ${leagueId}` };
@@ -90,13 +100,14 @@ async function getTeams(leagueId: number, season: number): Promise<ApiResult<Api
 }
 
 async function getFixtures(teamId: number): Promise<ApiResult<ApiFixturesResp>> {
+  // Includes cups because we do NOT filter by league
   return apiGet<ApiFixturesResp>("/fixtures", { team: teamId, last: 7, status: "FT" }, { noStore: true });
 }
 
 /* ---------------- BUILD MATCHES ---------------- */
 
 function buildMatches(teamId: number, fx: ApiFixturesResp): MatchRow[] {
-  return fx.response.map((f) => {
+  return (fx.response ?? []).map((f) => {
     const isHome = f.teams.home.id === teamId;
     const opponent = isHome ? f.teams.away.name : f.teams.home.name;
 
@@ -129,7 +140,7 @@ export async function getLeagueBoards(): Promise<LeagueBoardData[]> {
 async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
   const seasonRes = await getCurrentSeason(league.id);
   if (!seasonRes.ok) {
-    return { leagueId: league.id, leagueName: league.name, teams: [], error: seasonRes.error };
+    return { leagueId: league.id, leagueName: league.name, teams: [], error: pickError(seasonRes) };
   }
 
   const teamsRes = await getTeams(league.id, seasonRes.data);
@@ -139,14 +150,14 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
       leagueName: league.name,
       seasonUsed: seasonRes.data,
       teams: [],
-      error: teamsRes.error,
+      error: pickError(teamsRes),
     };
   }
 
-  const teams = teamsRes.data.response;
-
+  const teams = teamsRes.data.response ?? [];
   const rows: TeamRow[] = [];
 
+  // Simple + reliable (no TS tricks). If you hit 429 later we can add concurrency limits.
   for (const t of teams) {
     const fx = await getFixtures(t.team.id);
     const matches = fx.ok ? buildMatches(t.team.id, fx.data) : [];
