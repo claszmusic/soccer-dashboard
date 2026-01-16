@@ -26,6 +26,26 @@ export type LeagueBoard = {
 };
 
 async function resolveLeagueId(leagueName: string, country: string, season: number) {
+  // Try the requested season first
+  const trySeason = async (s: number) => {
+    const data = await apiFootball<{
+      response: Array<{ league: { id: number; name: string }; country: { name: string } }>;
+    }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
+
+    const id = data.response?.[0]?.league?.id;
+    return id ?? null;
+  };
+
+  const idNow = await trySeason(season);
+  if (idNow) return idNow;
+
+  // Fallback: previous season (common when new season data isn't available yet)
+  const idPrev = await trySeason(season - 1);
+  if (idPrev) return idPrev;
+
+  throw new Error(`Could not find league id for ${leagueName} (${country}) season ${season} or ${season - 1}`);
+}
+
   const data = await apiFootball<{
     response: Array<{ league: { id: number; name: string }; country: { name: string } }>;
   }>("/leagues", { name: leagueName, country, season }, 60 * 60 * 24);
