@@ -93,6 +93,22 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 
 async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
   const r = await apiGet<ApiLeagueResp>("/leagues", { id: leagueId }, { noStore: true });
+
+  // ✅ convert ApiResult<ApiLeagueResp> -> ApiResult<number>
+  if (!r.ok) {
+    return { ok: false, error: r.error, status: r.status, details: r.details };
+  }
+
+  const seasons = r.data.response?.[0]?.seasons ?? [];
+  const current = seasons.find((s) => s.current)?.year;
+  const fallback = seasons.map((s) => s.year).sort((a, b) => b - a)[0];
+  const year = current ?? fallback;
+
+  if (!year) return { ok: false, error: `No seasons found for league ${leagueId}` };
+  return { ok: true, data: year };
+}
+
+  const r = await apiGet<ApiLeagueResp>("/leagues", { id: leagueId }, { noStore: true });
   if (!r.ok) return r;
 
   const seasons = r.data.response?.[0]?.seasons ?? [];
