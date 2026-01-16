@@ -2,7 +2,7 @@ import { apiFootball } from "./apifootball";
 
 export type MatchCell = {
   fixtureId?: number;
-  opponent?: string; // who they played
+  opponent?: string;
   homeAway?: "H" | "A";
   ck?: number;
   g?: number;
@@ -23,7 +23,7 @@ export type LeagueBoard = {
 async function resolveLeague(leagueName: string, country: string, season: number) {
   const trySeason = async (s: number) => {
     const data = await apiFootball<{
-      response: Array<{ league: { id: number }; country: { name: string } }>;
+      response: Array<{ league: { id: number } }>;
     }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
 
     const id = data.response?.[0]?.league?.id ?? null;
@@ -46,27 +46,22 @@ export async function buildLeagueBoard(opts: {
   const { leagueName, country, season, columns = 7 } = opts;
 
   const resolved = await resolveLeague(leagueName, country, season);
-  if (!resolved) {
-    // Never crash the whole page
-    return { leagueTitle: leagueName, season, columns, rows: [] };
-  }
+  if (!resolved) return { leagueTitle: leagueName, season, columns, rows: [] };
 
   const { leagueId, seasonUsed } = resolved;
 
-  // 1) Get ALL teams
+  // All teams in the league
   const teams = await apiFootball<{
     response: Array<{ team: { id: number; name: string } }>;
   }>("/teams", { league: leagueId, season: seasonUsed }, 60 * 60 * 24);
 
   const teamList = teams.response.map((t) => ({ id: t.team.id, name: t.team.name }));
 
-  // 2) For each team, fetch LAST 7 matches.
-  // Prefer finished (FT) so we get real numbers, but if league has no finished yet, fallback to last matches anyway.
   const rows: LeagueBoard["rows"] = [];
 
   for (const team of teamList) {
-    // Try finished matches first
-    let fixtures = await apiFootball<{
+    // FT ONLY — pull more than 7 so we’re safe
+    const fixtures = await apiFootball<{
       response: Array<{
         fixture: { id: number; status: { short: string } };
         teams: {
@@ -75,33 +70,21 @@ export async function buildLeagueBoard(opts: {
         };
         goals: { home: number | null; away: number | null };
       }>;
-    }>("/fixtures", { league: leagueId, season: seasonUsed, team: team.id, status: "FT", last: columns }, 60 * 60 * 6);
+    }>(
+      "/fixtures",
+      { league: leagueId, season: seasonUsed, team: team.id, status: "FT", last: 25 },
+      60 * 60 * 6
+    );
 
-    // If not enough finished games, fallback to whatever exists
-    if (!fixtures.response || fixtures.response.length < columns) {
-      fixtures = await apiFootball<{
-        response: Array<{
-          fixture: { id: number; status: { short: string } };
-          teams: {
-            home: { id: number; name: string };
-            away: { id: number; name: string };
-          };
-          goals: { home: number | null; away: number | null };
-        }>;
-      }>("/fixtures", { league: leagueId, season: seasonUsed, team: team.id, last: columns }, 60 * 60 * 6);
-    }
+    const ft = (fixtures.response || []).filter((fx) => fx.fixture.status.short === "FT").slice(0, columns);
 
     const cells: MatchCell[] = [];
 
-    for (const fx of fixtures.response.slice(0, columns)) {
+    for (const fx of ft) {
       const isHome = fx.teams.home.id === team.id;
       const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
       const goalsFor = isHome ? (fx.goals.home ?? 0) : (fx.goals.away ?? 0);
 
-      const status = fx.fixture.status.short;
-      const isFinished = status === "FT" || status === "AET" || status === "PEN";
-
-      // default
       const cell: MatchCell = {
         fixtureId: fx.fixture.id,
         opponent,
@@ -109,33 +92,31 @@ export async function buildLeagueBoard(opts: {
         g: goalsFor,
       };
 
-      // Corners/Cards only if finished (stats usually not ready before FT)
-      if (isFinished) {
-        try {
-          const stats = await apiFootball<{
-            response: Array<{
-              team: { id: number };
-              statistics: Array<{ type: string; value: number | null }>;
-            }>;
-          }>("/fixtures/statistics", { fixture: fx.fixture.id }, 60 * 60 * 24);
+      // Stats (corners/cards). Even for FT, sometimes stats can be missing → keep safe.
+      try {
+        const stats = await apiFootball<{
+          response: Array<{
+            team: { id: number };
+            statistics: Array<{ type: string; value: number | null }>;
+          }>;
+        }>("/fixtures/statistics", { fixture: fx.fixture.id }, 60 * 60 * 24);
 
-          const teamStats = stats.response.find((s) => s.team.id === team.id)?.statistics ?? [];
+        const teamStats = stats.response.find((s) => s.team.id === team.id)?.statistics ?? [];
 
-          const corners = getStatValue(teamStats, "Corner Kicks");
-          const yellows = getStatValue(teamStats, "Yellow Cards") ?? 0;
-          const reds = getStatValue(teamStats, "Red Cards") ?? 0;
+        const corners = getStatValue(teamStats, "Corner Kicks");
+        const yellows = getStatValue(teamStats, "Yellow Cards") ?? 0;
+        const reds = getStatValue(teamStats, "Red Cards") ?? 0;
 
-          cell.ck = typeof corners === "number" ? corners : undefined;
-          cell.c = yellows + reds;
-        } catch {
-          // leave ck/c undefined if stats missing
-        }
+        cell.ck = typeof corners === "number" ? corners : undefined;
+        cell.c = yellows + reds;
+      } catch {
+        // leave ck/c undefined if stats missing
       }
 
       cells.push(cell);
     }
 
-    // Always ensure exactly 7 cells so the UI never collapses
+    // Always keep 7 columns so UI never collapses
     while (cells.length < columns) cells.push({});
 
     rows.push({
