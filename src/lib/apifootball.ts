@@ -1,32 +1,66 @@
-export async function apiFootball<T>(
+// src/lib/apiFootball.ts
+export type ApiOk<T> = { ok: true; data: T };
+export type ApiErr = { ok: false; error: string; status?: number; details?: unknown };
+export type ApiResult<T> = ApiOk<T> | ApiErr;
+
+const BASE_URL = "https://v3.football.api-sports.io";
+
+function getKey(): string {
+  const key = process.env.APISPORTS_KEY || process.env.API_FOOTBALL_KEY;
+  if (!key) throw new Error("Missing env var: APISPORTS_KEY (or API_FOOTBALL_KEY)");
+  return key;
+}
+
+export async function apiGet<T>(
   path: string,
-  params: Record<string, any>,
-  cacheSeconds = 60
-): Promise<T> {
-  const key = process.env.APISPORTS_KEY;
-
-  if (!key) {
-    // Don't crash the whole app — return an empty-like object by throwing a friendly error
-    throw new Error("Missing APISPORTS_KEY env var in this environment (Vercel Production?)");
+  params: Record<string, string | number | boolean | undefined> = {},
+  opts: { noStore?: boolean } = {}
+): Promise<ApiResult<T>> {
+  let url = `${BASE_URL}${path}`;
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined) continue;
+    qs.set(k, String(v));
   }
+  if ([...qs.keys()].length) url += `?${qs.toString()}`;
 
-  const url = new URL(`https://v3.football.api-sports.io${path}`);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v === undefined || v === null || v === "") return;
-    url.searchParams.set(k, String(v));
-  });
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "x-apisports-key": getKey(),
+      },
+      // Avoid “sometimes empty” caching on Vercel
+      cache: opts.noStore ? "no-store" : "force-cache",
+      // If you want auto refresh, you can also use:
+      // next: { revalidate: 60 },
+    });
 
-  const res = await fetch(url.toString(), {
-    headers: { "x-apisports-key": key },
-    // keep it simple/stable on Vercel:
-    cache: "no-store",
-  });
+    const status = res.status;
+    let json: any = null;
+    try {
+      json = await res.json();
+    } catch {
+      // ignore
+    }
 
-  // If API returns an error, we throw (and we will catch it in page.tsx)
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`API-Football error ${res.status}: ${text.slice(0, 200)}`);
+    if (!res.ok) {
+      const msg =
+        json?.errors
+          ? `API error: ${JSON.stringify(json.errors)}`
+          : json?.message
+            ? `API message: ${json.message}`
+            : `HTTP ${status}`;
+      return { ok: false, error: msg, status, details: json };
+    }
+
+    // API-Football typically uses: { response: ... , errors: ... }
+    if (json?.errors && Object.keys(json.errors).length > 0) {
+      return { ok: false, error: `API errors: ${JSON.stringify(json.errors)}`, status, details: json };
+    }
+
+    return { ok: true, data: json as T };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? "Network error", details: e };
   }
-
-  return (await res.json()) as T;
 }
