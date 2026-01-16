@@ -1,63 +1,93 @@
-export const dynamic = "force-dynamic";
+"use client";
 
-async function fetchBoards() {
-  const res = await fetch("/api/leagueboards", {
-    cache: "no-store",
-  });
+import { useEffect, useState } from "react";
 
-  let json: any = null;
-  try {
-    json = await res.json();
-  } catch {}
+type LeagueBoard = {
+  leagueId: number;
+  leagueName: string;
+  seasonUsed?: number;
+  teams: any[];
+  error?: string;
+};
 
-  if (!res.ok || !json?.ok) {
-    return { ok: false as const, error: json?.error ?? `HTTP ${res.status}` };
-  }
+type LoadState =
+  | { status: "loading" }
+  | { status: "error"; error: string }
+  | { status: "ok"; data: LeagueBoard[] };
 
-  return { ok: true as const, data: json.data };
-}
+export default function HomePage() {
+  const [state, setState] = useState<LoadState>({ status: "loading" });
 
-export default async function HomePage() {
-  const result = await fetchBoards();
+  useEffect(() => {
+    let cancelled = false;
 
-  if (!result.ok) {
-    return (
-      <main className="p-6">
-        <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
-        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-4 text-red-900">
-          Error loading boards: {result.error}
-        </div>
-      </main>
-    );
-  }
+    (async () => {
+      try {
+        const res = await fetch("/api/leagueboards", { cache: "no-store" });
+        const json = await res.json().catch(() => null);
 
-  const boards = result.data;
+        if (!res.ok || !json?.ok) {
+          const msg = json?.error ?? `HTTP ${res.status} from /api/leagueboards`;
+          if (!cancelled) setState({ status: "error", error: msg });
+          return;
+        }
+
+        if (!cancelled) setState({ status: "ok", data: json.data });
+      } catch (e: any) {
+        if (!cancelled) setState({ status: "error", error: e?.message ?? "Fetch failed" });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <main className="p-6">
       <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
 
-      {boards.map((board: any) => (
-        <section key={board.leagueId} className="mt-10">
-          <h2 className="text-4xl font-black">{board.leagueName}</h2>
+      {/* BIG marker so we KNOW this new file is deployed */}
+      <div className="mt-2 text-sm text-gray-500">
+        DEBUG BUILD MARKER: page.tsx updated ✅
+      </div>
 
-          {board.error && (
-            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-amber-900">
-              {board.error}
-            </div>
-          )}
+      {state.status === "loading" && (
+        <div className="mt-6 rounded-lg border p-4 text-gray-600">Loading league boards…</div>
+      )}
 
-          {!board.teams?.length ? (
-            <div className="mt-4 rounded-lg border p-4 text-gray-600">
-              No data returned for this league right now.
-            </div>
-          ) : (
-            <div className="mt-4 text-green-700">
-              Data received for {board.teams.length} teams.
-            </div>
-          )}
-        </section>
-      ))}
+      {state.status === "error" && (
+        <div className="mt-6 rounded-lg border border-red-200 bg-red-50 p-4 text-red-900">
+          <div className="font-semibold">Error</div>
+          <div className="mt-1">{state.error}</div>
+          <div className="mt-2 text-sm">
+            Open <span className="font-mono">/api/leagueboards</span> in your browser to see the raw JSON error.
+          </div>
+        </div>
+      )}
+
+      {state.status === "ok" &&
+        state.data.map((board) => (
+          <section key={board.leagueId} className="mt-10">
+            <h2 className="text-4xl font-black">{board.leagueName}</h2>
+
+            {board.error && (
+              <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-amber-900">
+                {board.error}
+              </div>
+            )}
+
+            {!board.teams?.length ? (
+              <div className="mt-4 rounded-lg border p-4 text-gray-600">
+                No data returned for this league right now.
+              </div>
+            ) : (
+              <div className="mt-4 rounded-lg border p-4 text-green-700">
+                Data received for <b>{board.teams.length}</b> teams.
+              </div>
+            )}
+          </section>
+        ))}
     </main>
   );
 }
