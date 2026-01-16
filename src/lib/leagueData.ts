@@ -11,7 +11,7 @@ type ApiTeamsResp = {
   response: { team: { id: number; name: string; logo: string } }[];
 };
 
-type ApiFixturesResp = {
+type ApiLeagueFixturesResp = {
   response: {
     fixture: { id: number; date: string; status?: { short?: string } };
     teams: {
@@ -38,9 +38,9 @@ export type MatchRow = {
   isHome: boolean;
 
   // YOU WANT COMBINED TOTALS:
-  goalsTotal: number;      // home+away
-  cornersTotal: number | null; // home+away
-  cardsTotal: number | null;   // (yellow+red) home+away
+  goalsTotal: number;            // home+away
+  cornersTotal: number | null;   // home+away (null if unavailable / rate-limited)
+  cardsTotal: number | null;     // (yellow+red) home+away (null if unavailable / rate-limited)
 };
 
 export type TeamRow = {
@@ -82,22 +82,15 @@ function getTeamStat(
   return statToNumber(s?.value);
 }
 
-/* ---------------- API CALLS ---------------- */
-
-// Cache to reduce repeated calls inside one request
-const fixtureStatsCache = new Map<number, Promise<ApiResult<ApiFixtureStatsResp>>>();
-
-async function getFixtureStats(fixtureId: number): Promise<ApiResult<ApiFixtureStatsResp>> {
-  if (!fixtureStatsCache.has(fixtureId)) {
-    fixtureStatsCache.set(
-      fixtureId,
-      apiGet<ApiFixtureStatsResp>("/fixtures/statistics", { fixture: fixtureId }, { noStore: true })
-    );
-  }
-  return fixtureStatsCache.get(fixtureId)!;
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let i = 0;
 
@@ -111,6 +104,51 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 
   await Promise.all(workers);
   return results;
+}
+
+/* ---------------- API CALLS ---------------- */
+
+// In-memory cache for this request run (helps a lot)
+const fixtureStatsCache = new Map<number, ApiFixtureStatsResp | null>();
+
+async function getFixtureStatsWithRetry(fixtureId: number): Promise<ApiFixtureStatsResp | null> {
+  if (fixtureStatsCache.has(fixtureId)) return fixtureStatsCache.get(fixtureId)!;
+
+  // 429 happens even on paid plans if you burst.
+  // We'll go slow + retry.
+  const maxTries = 4;
+
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    // slow down between calls (burst control)
+    await sleep(250);
+
+    const r = await apiGet<ApiFixtureStatsResp>(
+      "/fixtures/statistics",
+      { fixture: fixtureId },
+      { noStore: true }
+    );
+
+    if (r.ok) {
+      fixtureStatsCache.set(fixtureId, r.data);
+      return r.data;
+    }
+
+    const err = pickError(r);
+    const isRate = err.toLowerCase().includes("rate") || err.toLowerCase().includes("too many");
+
+    // If it's rate limit, backoff and retry
+    if (isRate && attempt < maxTries) {
+      await sleep(600 * attempt);
+      continue;
+    }
+
+    // For ANY failure, do not break the whole page. Just mark stats missing.
+    fixtureStatsCache.set(fixtureId, null);
+    return null;
+  }
+
+  fixtureStatsCache.set(fixtureId, null);
+  return null;
 }
 
 async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
@@ -130,63 +168,17 @@ async function getTeams(leagueId: number, season: number): Promise<ApiResult<Api
   return apiGet<ApiTeamsResp>("/teams", { league: leagueId, season }, { noStore: true });
 }
 
-async function getLast7FinishedFixtures(teamId: number): Promise<ApiResult<ApiFixturesResp>> {
-  return apiGet<ApiFixturesResp>(
+async function getRecentLeagueFixtures(leagueId: number, season: number): Promise<ApiResult<ApiLeagueFixturesResp>> {
+  // ✅ Key optimization: ONE call per league instead of one per team.
+  // Increase last if you notice some teams don’t get 7 finished games.
+  return apiGet<ApiLeagueFixturesResp>(
     "/fixtures",
-    { team: teamId, last: 7, status: "FT" },
+    { league: leagueId, season, status: "FT", last: 300 },
     { noStore: true }
   );
 }
 
-/* ---------------- BUILD MATCHES ---------------- */
-
-async function buildMatchesForTeam(teamId: number, fx: ApiFixturesResp): Promise<MatchRow[]> {
-  const list = (fx.response ?? []).slice(0, 7);
-
-  // Preload stats sequentially (limit=1) to avoid 429
-  await mapLimit(
-    list,
-    1,
-    async (f) => {
-      await getFixtureStats(f.fixture.id);
-      return null;
-    }
-  );
-
-  return list.map((f) => {
-    const isHome = f.teams.home.id === teamId;
-    const opponent = isHome ? f.teams.away.name : f.teams.home.name;
-
-    const homeGoals = f.goals.home ?? 0;
-    const awayGoals = f.goals.away ?? 0;
-    const goalsTotal = homeGoals + awayGoals;
-
-    // Stats: corners + cards require stats endpoint
-    // We compute TOTAL = home+away
-    let cornersTotal: number | null = null;
-    let cardsTotal: number | null = null;
-
-    const statsPromise = fixtureStatsCache.get(f.fixture.id);
-    // (It should exist because we preloaded above)
-    // But keep it safe:
-    // If it fails (rate limit), show null => UI displays "-"
-    // We cannot await here without making it sequential per row; instead read cached resolved promise safely.
-    // We'll do a synchronous-ish approach by marking totals null unless ok.
-    // However, we can safely compute by awaiting in the map (small list = 7).
-    // So we'll await here.
-    return {
-      fixtureId: f.fixture.id,
-      date: f.fixture.date,
-      opponent,
-      isHome,
-      goalsTotal,
-      cornersTotal,
-      cardsTotal,
-    };
-  });
-}
-
-/* ---------------- MAIN EXPORT ---------------- */
+/* ---------------- BUILD ---------------- */
 
 export async function getLeagueBoards(): Promise<LeagueBoardData[]> {
   fixtureStatsCache.clear();
@@ -210,68 +202,86 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
     };
   }
 
+  const fxRes = await getRecentLeagueFixtures(league.id, seasonRes.data);
+  if (!fxRes.ok) {
+    return {
+      leagueId: league.id,
+      leagueName: league.name,
+      seasonUsed: seasonRes.data,
+      teams: [],
+      error: pickError(fxRes),
+    };
+  }
+
+  const allFixtures = (fxRes.data.response ?? []).slice();
+
+  // sort newest first
+  allFixtures.sort((a, b) => (a.fixture.date < b.fixture.date ? 1 : -1));
+
   const teams = teamsRes.data.response ?? [];
 
-  // Fetch fixtures sequentially per team to reduce load
-  const rows: TeamRow[] = [];
+  // Pick last 7 per team from league fixtures (home or away)
+  const teamMatches = new Map<number, ApiLeagueFixturesResp["response"][0][]>();
 
-  // First, collect fixtures for all teams (minimal calls)
-  const teamFixtures: { teamId: number; name: string; logo: string; fx: ApiFixturesResp | null }[] = [];
-  for (const t of teams) {
-    const fx = await getLast7FinishedFixtures(t.team.id);
-    teamFixtures.push({
-      teamId: t.team.id,
-      name: t.team.name,
-      logo: t.team.logo,
-      fx: fx.ok ? fx.data : null,
-    });
+  for (const t of teams) teamMatches.set(t.team.id, []);
+
+  for (const f of allFixtures) {
+    const homeId = f.teams.home.id;
+    const awayId = f.teams.away.id;
+
+    const hList = teamMatches.get(homeId);
+    if (hList && hList.length < 7) hList.push(f);
+
+    const aList = teamMatches.get(awayId);
+    if (aList && aList.length < 7) aList.push(f);
   }
 
-  // Next, collect unique fixture IDs across the whole league (for caching & fewer stats calls)
-  const fixtureIds = new Set<number>();
-  for (const tf of teamFixtures) {
-    for (const f of tf.fx?.response ?? []) fixtureIds.add(f.fixture.id);
+  // Stats only for UNIQUE fixtures that are actually displayed
+  const neededFixtureIds = new Set<number>();
+  for (const list of teamMatches.values()) {
+    for (const f of list) neededFixtureIds.add(f.fixture.id);
   }
 
-  // Preload fixture statistics VERY slowly to avoid rate limits
-  const uniqueIds = Array.from(fixtureIds);
+  const uniqueIds = Array.from(neededFixtureIds);
+
+  // Slow stats calls to avoid 429 (limit=1 is intentional)
   await mapLimit(uniqueIds, 1, async (id) => {
-    await getFixtureStats(id);
+    await getFixtureStatsWithRetry(id);
     return null;
   });
 
-  // Now build each team rows, including combined totals from stats
-  for (const tf of teamFixtures) {
-    const matchesRaw = (tf.fx?.response ?? []).slice(0, 7);
+  // Build output
+  const rows: TeamRow[] = teams.map((t) => {
+    const list = teamMatches.get(t.team.id) ?? [];
 
-    const matches: MatchRow[] = [];
-    for (const f of matchesRaw) {
-      const isHome = f.teams.home.id === tf.teamId;
+    const matches: MatchRow[] = list.map((f) => {
+      const isHome = f.teams.home.id === t.team.id;
       const opponent = isHome ? f.teams.away.name : f.teams.home.name;
 
       const homeGoals = f.goals.home ?? 0;
       const awayGoals = f.goals.away ?? 0;
 
+      const stats = fixtureStatsCache.get(f.fixture.id) ?? null;
+
       let cornersTotal: number | null = null;
       let cardsTotal: number | null = null;
 
-      const statsRes = await getFixtureStats(f.fixture.id);
-      if (statsRes.ok) {
+      if (stats) {
         const homeId = f.teams.home.id;
         const awayId = f.teams.away.id;
 
-        const homeCorners = getTeamStat(statsRes.data.response, homeId, "Corner Kicks");
-        const awayCorners = getTeamStat(statsRes.data.response, awayId, "Corner Kicks");
+        const homeCorners = getTeamStat(stats.response, homeId, "Corner Kicks");
+        const awayCorners = getTeamStat(stats.response, awayId, "Corner Kicks");
         cornersTotal = homeCorners + awayCorners;
 
-        const homeY = getTeamStat(statsRes.data.response, homeId, "Yellow Cards");
-        const homeR = getTeamStat(statsRes.data.response, homeId, "Red Cards");
-        const awayY = getTeamStat(statsRes.data.response, awayId, "Yellow Cards");
-        const awayR = getTeamStat(statsRes.data.response, awayId, "Red Cards");
+        const homeY = getTeamStat(stats.response, homeId, "Yellow Cards");
+        const homeR = getTeamStat(stats.response, homeId, "Red Cards");
+        const awayY = getTeamStat(stats.response, awayId, "Yellow Cards");
+        const awayR = getTeamStat(stats.response, awayId, "Red Cards");
         cardsTotal = (homeY + homeR) + (awayY + awayR);
       }
 
-      matches.push({
+      return {
         fixtureId: f.fixture.id,
         date: f.fixture.date,
         opponent,
@@ -279,17 +289,19 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
         goalsTotal: homeGoals + awayGoals,
         cornersTotal,
         cardsTotal,
-      });
-    }
-
-    rows.push({
-      teamId: tf.teamId,
-      name: tf.name,
-      logo: tf.logo,
-      matches,
+      };
     });
-  }
 
+    return {
+      teamId: t.team.id,
+      name: t.team.name,
+      logo: t.team.logo,
+      matches,
+    };
+  });
+
+  // IMPORTANT: We do NOT fail the league just because stats were rate-limited.
+  // Goals will still show, CK/C will be "-" until stats succeed.
   return {
     leagueId: league.id,
     leagueName: league.name,
