@@ -1,14 +1,16 @@
 // src/lib/leagueData.ts
-// STABLE "ALWAYS LAST 7" VERSION (works across season boundaries)
+// STABLE "ALWAYS LAST 7" VERSION (with ID + NAME fallback matching)
 //
-// Fixes the random missing-team blanks by:
-// - cache: "no-store" (no Vercel/Next partial caching)
-// - Fetching fixtures for BOTH current season + previous season, merging and sorting
-// - Per-team fallback WITHOUT season (team + last=60), so it still works if season/year is weird
-// - Never dropping matches if corners/cards fail
+// Fixes the last remaining issue you see (ex: Tigres row blank while Tigres appears in other rows)
+// by matching fixtures to teams using:
+// 1) teamId match (preferred)
+// 2) normalized team name match (fallback)
 //
-// Output fields used by UI:
-// goalsTotal / cornersTotal / cardsTotal
+// Also:
+// - cache: "no-store" (prevents Vercel/Next caching partial API results)
+// - league fixtures fetched across current + previous season
+// - per-team fallback without season if still empty
+// - corners/cards failures never drop the match card
 
 export type MatchCard = {
   fixtureId: number;
@@ -107,6 +109,15 @@ function sumNumbers(values: Array<number | null>): number | null {
   const any = values.some((x) => x !== null);
   if (!any) return null;
   return values.reduce((acc, v) => acc + (v ?? 0), 0);
+}
+
+function normName(s: string) {
+  return (s ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .replace(/[^a-z0-9]+/g, " ") // non-alnum -> space
+    .trim();
 }
 
 function sortByDateDesc<T extends { fixture: { date: string } }>(arr: T[]): T[] {
@@ -218,10 +229,8 @@ async function getTeamsForLeague(leagueId: number, season: number): Promise<Team
   }));
 }
 
-// Fetch finished fixtures for BOTH current + previous season, merge, sort.
 async function getLeagueFinishedFixturesAcrossSeasons(leagueId: number, season: number) {
   const seasonsToTry = [season, season - 1];
-
   const all: ApiFixturesResp["response"] = [];
 
   for (const s of seasonsToTry) {
@@ -243,9 +252,8 @@ async function getLeagueFinishedFixturesAcrossSeasons(leagueId: number, season: 
   return sortByDateDesc(Array.from(byId.values()));
 }
 
-// Per-team fallback WITHOUT season (prevents season boundary blanks)
 async function getTeamFinishedFixturesNoSeason(teamId: number) {
-  const r = await apiFetch<ApiFixturesResp>("/fixtures", { team: teamId, last: 60 });
+  const r = await apiFetch<ApiFixturesResp>("/fixtures", { team: teamId, last: 80 });
   if (!r.ok) return [];
 
   const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
@@ -300,6 +308,17 @@ async function retryNullable<T>(
   return null;
 }
 
+// Match fixtures to team: ID first, then name fallback
+function teamInFixture(team: TeamBoard, fx: ApiFixturesResp["response"][number]) {
+  if (fx.teams.home.id === team.teamId || fx.teams.away.id === team.teamId) return true;
+
+  const tn = normName(team.name);
+  const hn = normName(fx.teams.home.name);
+  const an = normName(fx.teams.away.name);
+
+  return tn === hn || tn === an;
+}
+
 // ---------------- exported ----------------
 export async function getLeagueBoards(): Promise<LeagueBoard[]> {
   const fxLimiter = createLimiter(2);
@@ -330,24 +349,21 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       continue;
     }
 
-    // One league list across current+previous season (prevents season-boundary blanks)
     const leagueFinished = await getLeagueFinishedFixturesAcrossSeasons(league.leagueId, season);
 
-    // For each team: pick last 7 from league list; if none -> fallback no-season
+    // 1) Build last-7 fixtures per team using ID+NAME matching
     const perTeamFixtures = await Promise.all(
       teams.map(async (t) => {
-        const fromLeague = leagueFinished
-          .filter((fx) => fx.teams.home.id === t.teamId || fx.teams.away.id === t.teamId)
-          .slice(0, 7);
-
+        const fromLeague = leagueFinished.filter((fx) => teamInFixture(t, fx)).slice(0, 7);
         if (fromLeague.length > 0) return { team: t, fixtures: fromLeague };
 
+        // Fallback if still empty (no-season)
         const fallback = await getTeamFinishedFixturesNoSeason(t.teamId);
         return { team: t, fixtures: fallback };
       })
     );
 
-    // Dedup fixture IDs for stats/events
+    // 2) Dedup fixtures we actually show for stats/events
     const fixtureIdsSet = new Set<number>();
     for (const tf of perTeamFixtures) {
       for (const fx of tf.fixtures) fixtureIdsSet.add(fx.fixture.id);
@@ -367,12 +383,16 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       )
     );
 
+    // 3) Map into match cards, always 7
     const filledTeams: TeamBoard[] = perTeamFixtures.map(({ team, fixtures }) => {
       const real: MatchCard[] = fixtures.map((fx) => {
         const fixtureId = fx.fixture.id;
         const date = fx.fixture.date;
 
-        const isHome = team.teamId === fx.teams.home.id;
+        const isHome = normName(fx.teams.home.name) === normName(team.name)
+          ? true
+          : fx.teams.home.id === team.teamId;
+
         const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
 
         const homeGoals = fx.goals.home ?? 0;
@@ -397,18 +417,21 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       return { ...team, matches };
     });
 
+    // If a team still has 0 real fixtures, surface a helpful note
+    const zeros = filledTeams.filter((t) => t.matches.every((m) => m.fixtureId === 0)).length;
+
     out.push({
       leagueId: league.leagueId,
       leagueName: league.leagueName,
       seasonUsed: season,
       teams: filledTeams,
       error:
-        leagueFinished.length === 0
-          ? "League fixtures returned empty; using team fallback where possible."
+        zeros > 0
+          ? `Some teams returned 0 fixtures from API (showing blanks): ${zeros}. This is usually API throttling/partial data. Refresh later.`
           : undefined,
     });
 
-    await sleep(300);
+    await sleep(250);
   }
 
   return out;
