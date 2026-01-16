@@ -46,11 +46,7 @@ export default function HomePage() {
   return (
     <main className="p-6">
       <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
-
-      {/* BIG marker so we KNOW this new file is deployed */}
-      <div className="mt-2 text-sm text-gray-500">
-        DEBUG BUILD MARKER: page.tsx updated ✅
-      </div>
+      <div className="mt-2 text-sm text-gray-500">DEBUG BUILD MARKER: page.tsx updated ✅</div>
 
       {state.status === "loading" && (
         <div className="mt-6 rounded-lg border p-4 text-gray-600">Loading league boards…</div>
