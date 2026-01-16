@@ -19,14 +19,12 @@ type ApiFixturesResp = {
       away: { id: number; name: string };
     };
     goals: { home: number | null; away: number | null };
-  }[];
-};
 
-// NOTE: stats come from a different endpoint
-type ApiFixtureStatsResp = {
-  response: {
-    team: { id: number };
-    statistics: { type: string; value: number | string | null }[];
+    // When get=statistics is used, API-Football includes this field:
+    statistics?: {
+      team: { id: number };
+      statistics: { type: string; value: number | string | null }[];
+    }[];
   }[];
 };
 
@@ -39,8 +37,8 @@ export type MatchRow = {
   isHome: boolean;
   goalsFor: number;
   goalsAgainst: number;
-  corners: number | null; // null means "not available"
-  cards: number | null;   // null means "not available"
+  corners: number | null; // null = not available
+  cards: number | null;   // null = not available
 };
 
 export type TeamRow = {
@@ -65,7 +63,6 @@ function pickError(r: ApiResult<any>): string {
 }
 
 function isFinishedShort(short: string | undefined) {
-  // These are "finished" results you still want counted
   return short === "FT" || short === "AET" || short === "PEN";
 }
 
@@ -76,33 +73,23 @@ function statToNumber(v: number | string | null | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function getStatValue(stats: ApiFixtureStatsResp["response"], teamId: number, type: string): number {
+function getStat(stats: ApiFixturesResp["response"][0]["statistics"] | undefined, teamId: number, type: string) {
+  if (!stats) return null;
   const teamBlock = stats.find((x) => x.team.id === teamId);
-  if (!teamBlock) return 0;
+  if (!teamBlock) return null;
   const s = teamBlock.statistics.find((x) => x.type === type);
-  return statToNumber(s?.value);
-}
-
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let i = 0;
-
-  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) return;
-      results[idx] = await fn(items[idx]);
-    }
-  });
-
-  await Promise.all(workers);
-  return results;
+  return s ? statToNumber(s.value) : null;
 }
 
 /* ---------------- API CALLS ---------------- */
 
+// IMPORTANT: we will allow caching to reduce requests.
+// apiGet() currently uses fetch cache based on opts.noStore.
+// We'll call with noStore:false so Next can cache between requests.
+const CACHE_OK = { noStore: false };
+
 async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
-  const r = await apiGet<ApiLeagueResp>("/leagues", { id: leagueId }, { noStore: true });
+  const r = await apiGet<ApiLeagueResp>("/leagues", { id: leagueId }, CACHE_OK);
   if (!r.ok) return { ok: false, error: pickError(r) };
 
   const seasons = r.data.response?.[0]?.seasons ?? [];
@@ -115,45 +102,24 @@ async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
 }
 
 async function getTeams(leagueId: number, season: number): Promise<ApiResult<ApiTeamsResp>> {
-  return apiGet<ApiTeamsResp>("/teams", { league: leagueId, season }, { noStore: true });
+  return apiGet<ApiTeamsResp>("/teams", { league: leagueId, season }, CACHE_OK);
 }
 
-async function getRecentFixtures(teamId: number): Promise<ApiResult<ApiFixturesResp>> {
-  // IMPORTANT: pull more than 7, then filter "finished" (FT/AET/PEN), then take last 7
-  // This prevents "missing teams" when last=7 includes non-finished fixtures.
-  return apiGet<ApiFixturesResp>("/fixtures", { team: teamId, last: 15 }, { noStore: true });
-}
-
-// Cache stats per fixture (many teams share fixtures)
-const statsCache = new Map<number, Promise<ApiResult<ApiFixtureStatsResp>>>();
-
-async function getFixtureStats(fixtureId: number): Promise<ApiResult<ApiFixtureStatsResp>> {
-  if (!statsCache.has(fixtureId)) {
-    statsCache.set(
-      fixtureId,
-      apiGet<ApiFixtureStatsResp>("/fixtures/statistics", { fixture: fixtureId }, { noStore: true })
-    );
-  }
-  return statsCache.get(fixtureId)!;
+async function getRecentFixturesWithStats(teamId: number): Promise<ApiResult<ApiFixturesResp>> {
+  // KEY FIX: include statistics in the fixtures call (no per-fixture calls)
+  // Pull more than 7 and then filter finished.
+  return apiGet<ApiFixturesResp>(
+    "/fixtures",
+    { team: teamId, last: 15, get: "statistics" },
+    CACHE_OK
+  );
 }
 
 /* ---------------- BUILD MATCHES ---------------- */
 
-async function buildMatchesForTeam(teamId: number, fxRes: ApiFixturesResp): Promise<MatchRow[]> {
-  const all = fxRes.response ?? [];
-  const finished = all
-    .filter((f) => isFinishedShort(f.fixture?.status?.short))
-    // newest first is typical; we still slice safely
-    .slice(0, 7);
-
-  // Fetch stats for these fixtures with low concurrency (avoid 429)
-  const statsByFixture = await mapLimit(finished, 2, async (f) => {
-    const s = await getFixtureStats(f.fixture.id);
-    return { fixtureId: f.fixture.id, stats: s };
-  });
-
-  const statsMap = new Map<number, ApiResult<ApiFixtureStatsResp>>();
-  for (const x of statsByFixture) statsMap.set(x.fixtureId, x.stats);
+function buildMatches(teamId: number, fx: ApiFixturesResp): MatchRow[] {
+  const all = fx.response ?? [];
+  const finished = all.filter((f) => isFinishedShort(f.fixture?.status?.short)).slice(0, 7);
 
   return finished.map((f) => {
     const isHome = f.teams.home.id === teamId;
@@ -162,17 +128,10 @@ async function buildMatchesForTeam(teamId: number, fxRes: ApiFixturesResp): Prom
     const goalsFor = isHome ? f.goals.home ?? 0 : f.goals.away ?? 0;
     const goalsAgainst = isHome ? f.goals.away ?? 0 : f.goals.home ?? 0;
 
-    const statsRes = statsMap.get(f.fixture.id);
-    let corners: number | null = null;
-    let cards: number | null = null;
-
-    if (statsRes?.ok) {
-      const cornersN = getStatValue(statsRes.data.response, teamId, "Corner Kicks");
-      const yellow = getStatValue(statsRes.data.response, teamId, "Yellow Cards");
-      const red = getStatValue(statsRes.data.response, teamId, "Red Cards");
-      corners = Number.isFinite(cornersN) ? cornersN : null;
-      cards = Number.isFinite(yellow + red) ? yellow + red : null;
-    }
+    const corners = getStat(f.statistics, teamId, "Corner Kicks");
+    const yellow = getStat(f.statistics, teamId, "Yellow Cards");
+    const red = getStat(f.statistics, teamId, "Red Cards");
+    const cards = yellow === null && red === null ? null : (yellow ?? 0) + (red ?? 0);
 
     return {
       fixtureId: f.fixture.id,
@@ -190,8 +149,6 @@ async function buildMatchesForTeam(teamId: number, fxRes: ApiFixturesResp): Prom
 /* ---------------- MAIN EXPORT ---------------- */
 
 export async function getLeagueBoards(): Promise<LeagueBoardData[]> {
-  // Clear cache per request (prevents memory growth across serverless invocations)
-  statsCache.clear();
   return Promise.all(LEAGUES.map(getLeagueBoard));
 }
 
@@ -214,23 +171,26 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
 
   const teams = teamsRes.data.response ?? [];
 
-  // Fetch team fixtures with a moderate concurrency limit
-  const teamRows = await mapLimit(teams, 3, async (t) => {
-    const fx = await getRecentFixtures(t.team.id);
-    const matches = fx.ok ? await buildMatchesForTeam(t.team.id, fx.data) : [];
+  // IMPORTANT: do NOT run all teams in parallel (rate limit).
+  // Sequential is safest on free-tier.
+  const rows: TeamRow[] = [];
 
-    return {
+  for (const t of teams) {
+    const fx = await getRecentFixturesWithStats(t.team.id);
+    const matches = fx.ok ? buildMatches(t.team.id, fx.data) : [];
+
+    rows.push({
       teamId: t.team.id,
       name: t.team.name,
       logo: t.team.logo,
       matches,
-    } satisfies TeamRow;
-  });
+    });
+  }
 
   return {
     leagueId: league.id,
     leagueName: league.name,
     seasonUsed: seasonRes.data,
-    teams: teamRows,
+    teams: rows,
   };
 }
