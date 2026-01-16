@@ -32,14 +32,17 @@ function corners(stats: Array<{ type: string; value: number | null }>) {
   return num(ck);
 }
 
-async function resolveLeagueId(leagueName: string, country: string) {
-  const data = await apiFootball<{ response: Array<{ league: { id: number } }> }>(
-    "/leagues",
-    { name: leagueName, country }
-  );
-  const id = data.response?.[0]?.league?.id;
-  if (!id) throw new Error(`Could not find league id for ${leagueName} (${country})`);
-  return id;
+async function resolveLeagueId(leagueName: string, country: string): Promise<number | null> {
+  try {
+    const data = await apiFootball<{ response: Array<{ league: { id: number } }> }>(
+      "/leagues",
+      { name: leagueName, country }
+    );
+    const id = data.response?.[0]?.league?.id;
+    return id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function buildLeagueBoard(opts: {
@@ -50,17 +53,20 @@ export async function buildLeagueBoard(opts: {
   const { leagueName, country, columns = 7 } = opts;
 
   const leagueId = await resolveLeagueId(leagueName, country);
+  if (!leagueId) return { leagueTitle: leagueName, rows: [] };
 
-  // Get teams (use current season if API requires it; many endpoints still return teams without season)
-  // We'll try without season first, then fallback to 2025 if needed.
+  // Teams: try with a fallback season (many APIs require season here)
   let teamsResp:
     | { response: Array<{ team: { id: number; name: string } }> }
     | null = null;
 
   try {
-    teamsResp = await apiFootball("/teams", { league: leagueId });
+    teamsResp = await apiFootball("/teams", { league: leagueId, season: new Date().getFullYear() });
+    if (!teamsResp?.response?.length) {
+      teamsResp = await apiFootball("/teams", { league: leagueId, season: new Date().getFullYear() - 1 });
+    }
   } catch {
-    teamsResp = await apiFootball("/teams", { league: leagueId, season: 2025 });
+    return { leagueTitle: leagueName, rows: [] };
   }
 
   const teamList = (teamsResp?.response ?? []).map((t) => ({
@@ -68,60 +74,58 @@ export async function buildLeagueBoard(opts: {
     name: t.team.name,
   }));
 
-  // If teams still empty, return empty board (UI will show no rows)
-  if (teamList.length === 0) {
-    return { leagueTitle: leagueName, rows: [] };
-  }
+  if (teamList.length === 0) return { leagueTitle: leagueName, rows: [] };
 
   const rows: LeagueBoard["rows"] = [];
 
   for (const team of teamList) {
-    // LAST 7 finished matches for that team (NO YEAR / NO SEASON)
-    const fixtures = await apiFootball<{
-      response: Array<{
-        fixture: { id: number };
-        teams: { home: { id: number; name: string }; away: { id: number; name: string } };
-        goals: { home: number | null; away: number | null };
-      }>;
-    }>("/fixtures", { team: team.id, status: "FT", last: columns });
+    let fixturesData:
+      | { response: Array<any> }
+      | null = null;
 
-    // newest -> oldest already; keep order as returned
+    try {
+      fixturesData = await apiFootball("/fixtures", { team: team.id, status: "FT", last: columns });
+    } catch {
+      fixturesData = { response: [] };
+    }
+
     const cells: MatchCell[] = [];
 
-    for (const fx of fixtures.response) {
-      const fixtureId = fx.fixture.id;
+    for (const fx of fixturesData.response ?? []) {
+      const fixtureId = fx.fixture?.id;
+      if (!fixtureId) continue;
 
-      const isHome = fx.teams.home.id === team.id;
-      const opponentName = isHome ? fx.teams.away.name : fx.teams.home.name;
+      const home = fx.teams?.home;
+      const away = fx.teams?.away;
+
+      if (!home?.id || !away?.id) continue;
+
+      const isHome = home.id === team.id;
+      const opponentName = isHome ? away.name : home.name;
       const opponent = `${opponentName} (${isHome ? "H" : "A"})`;
 
-      // TOTAL goals (home+away)
-      const gTotal = num(fx.goals.home) + num(fx.goals.away);
+      const gTotal = num(fx.goals?.home) + num(fx.goals?.away);
 
-      // Stats: corners + cards (need both teams stats; we sum them)
-      const stats = await apiFootball<{
-        response: Array<{
-          team: { id: number };
-          statistics: Array<{ type: string; value: number | null }>;
-        }>;
-      }>("/fixtures/statistics", { fixture: fixtureId });
+      // Stats (sum home+away)
+      let statsResp:
+        | { response: Array<{ team: { id: number }; statistics: Array<{ type: string; value: number | null }> }> }
+        | null = null;
 
-      const homeStats = stats.response.find((s) => s.team.id === fx.teams.home.id)?.statistics ?? [];
-      const awayStats = stats.response.find((s) => s.team.id === fx.teams.away.id)?.statistics ?? [];
+      try {
+        statsResp = await apiFootball("/fixtures/statistics", { fixture: fixtureId });
+      } catch {
+        statsResp = { response: [] };
+      }
+
+      const homeStats = statsResp.response.find((s) => s.team.id === home.id)?.statistics ?? [];
+      const awayStats = statsResp.response.find((s) => s.team.id === away.id)?.statistics ?? [];
 
       const ckTotal = corners(homeStats) + corners(awayStats);
       const cTotal = sumCards(homeStats) + sumCards(awayStats);
 
-      cells.push({
-        fixtureId,
-        opponent,
-        g: gTotal,
-        ck: ckTotal,
-        c: cTotal,
-      });
+      cells.push({ fixtureId, opponent, g: gTotal, ck: ckTotal, c: cTotal });
     }
 
-    // If a team has < 7 games, pad with blanks so columns stay fixed
     while (cells.length < columns) cells.push({});
 
     rows.push({
