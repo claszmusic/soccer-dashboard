@@ -13,14 +13,18 @@ type ApiTeamsResp = {
 
 type ApiFixturesResp = {
   response: {
-    fixture: { id: number; date: string; status: { short: string } };
+    fixture: {
+      id: number;
+      date: string;
+      status?: { short?: string };
+    };
     teams: {
       home: { id: number; name: string };
       away: { id: number; name: string };
     };
     goals: { home: number | null; away: number | null };
 
-    // When get=statistics is used, API-Football includes this field:
+    // Sometimes present, often NOT present unless you use a stats endpoint
     statistics?: {
       team: { id: number };
       statistics: { type: string; value: number | string | null }[];
@@ -37,8 +41,8 @@ export type MatchRow = {
   isHome: boolean;
   goalsFor: number;
   goalsAgainst: number;
-  corners: number | null; // null = not available
-  cards: number | null;   // null = not available
+  corners: number | null;
+  cards: number | null;
 };
 
 export type TeamRow = {
@@ -62,10 +66,6 @@ function pickError(r: ApiResult<any>): string {
   return (r && typeof r === "object" && "error" in r ? (r as any).error : "API error") as string;
 }
 
-function isFinishedShort(short: string | undefined) {
-  return short === "FT" || short === "AET" || short === "PEN";
-}
-
 function statToNumber(v: number | string | null | undefined): number {
   if (v === null || v === undefined) return 0;
   if (typeof v === "number") return v;
@@ -83,9 +83,7 @@ function getStat(stats: ApiFixturesResp["response"][0]["statistics"] | undefined
 
 /* ---------------- API CALLS ---------------- */
 
-// IMPORTANT: we will allow caching to reduce requests.
-// apiGet() currently uses fetch cache based on opts.noStore.
-// We'll call with noStore:false so Next can cache between requests.
+// Use caching so refresh doesn't hammer your plan.
 const CACHE_OK = { noStore: false };
 
 async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
@@ -105,29 +103,26 @@ async function getTeams(leagueId: number, season: number): Promise<ApiResult<Api
   return apiGet<ApiTeamsResp>("/teams", { league: leagueId, season }, CACHE_OK);
 }
 
-async function getRecentFixturesWithStats(teamId: number): Promise<ApiResult<ApiFixturesResp>> {
-  // KEY FIX: include statistics in the fixtures call (no per-fixture calls)
-  // Pull more than 7 and then filter finished.
-  return apiGet<ApiFixturesResp>(
-    "/fixtures",
-    { team: teamId, last: 15, get: "statistics" },
-    CACHE_OK
-  );
+async function getLast7FinishedFixtures(teamId: number): Promise<ApiResult<ApiFixturesResp>> {
+  // ✅ THE FIX:
+  // Ask API-Football for finished matches directly.
+  // This guarantees you get matches (and avoids relying on fixture.status shape).
+  return apiGet<ApiFixturesResp>("/fixtures", { team: teamId, last: 7, status: "FT" }, CACHE_OK);
 }
 
 /* ---------------- BUILD MATCHES ---------------- */
 
 function buildMatches(teamId: number, fx: ApiFixturesResp): MatchRow[] {
-  const all = fx.response ?? [];
-  const finished = all.filter((f) => isFinishedShort(f.fixture?.status?.short)).slice(0, 7);
+  const list = fx.response ?? [];
 
-  return finished.map((f) => {
+  return list.slice(0, 7).map((f) => {
     const isHome = f.teams.home.id === teamId;
     const opponent = isHome ? f.teams.away.name : f.teams.home.name;
 
     const goalsFor = isHome ? f.goals.home ?? 0 : f.goals.away ?? 0;
     const goalsAgainst = isHome ? f.goals.away ?? 0 : f.goals.home ?? 0;
 
+    // Usually null unless your API plan/endpoint returns them in fixtures
     const corners = getStat(f.statistics, teamId, "Corner Kicks");
     const yellow = getStat(f.statistics, teamId, "Yellow Cards");
     const red = getStat(f.statistics, teamId, "Red Cards");
@@ -170,13 +165,11 @@ async function getLeagueBoard(league: LeagueConfig): Promise<LeagueBoardData> {
   }
 
   const teams = teamsRes.data.response ?? [];
-
-  // IMPORTANT: do NOT run all teams in parallel (rate limit).
-  // Sequential is safest on free-tier.
   const rows: TeamRow[] = [];
 
+  // Sequential avoids rate limits on small plans.
   for (const t of teams) {
-    const fx = await getRecentFixturesWithStats(t.team.id);
+    const fx = await getLast7FinishedFixtures(t.team.id);
     const matches = fx.ok ? buildMatches(t.team.id, fx.data) : [];
 
     rows.push({
