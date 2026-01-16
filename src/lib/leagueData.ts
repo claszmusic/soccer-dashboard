@@ -1,10 +1,14 @@
 // src/lib/leagueData.ts
-// STABLE + SELF-HEALING VERSION
-// Fixes "teams randomly blank" by:
-// - Disabling caching (no-store) so Vercel doesn't serve partial API results
-// - Retrying if API returns suspiciously small/empty fixture payloads
-// - Per-team fallback if league fixture list doesn't include a team
+// STABLE "ALWAYS LAST 7" VERSION (works across season boundaries)
+//
+// Fixes the random missing-team blanks by:
+// - cache: "no-store" (no Vercel/Next partial caching)
+// - Fetching fixtures for BOTH current season + previous season, merging and sorting
+// - Per-team fallback WITHOUT season (team + last=60), so it still works if season/year is weird
 // - Never dropping matches if corners/cards fail
+//
+// Output fields used by UI:
+// goalsTotal / cornersTotal / cardsTotal
 
 export type MatchCard = {
   fixtureId: number;
@@ -105,7 +109,13 @@ function sumNumbers(values: Array<number | null>): number | null {
   return values.reduce((acc, v) => acc + (v ?? 0), 0);
 }
 
-// ---------------- API fetch (NO CACHE) + strong retry ----------------
+function sortByDateDesc<T extends { fixture: { date: string } }>(arr: T[]): T[] {
+  return arr
+    .slice()
+    .sort((a, b) => (a.fixture.date < b.fixture.date ? 1 : a.fixture.date > b.fixture.date ? -1 : 0));
+}
+
+// ---------------- API fetch (NO CACHE) + retry ----------------
 async function apiFetch<T>(
   path: string,
   params: Record<string, string | number | boolean | undefined> = {}
@@ -124,7 +134,6 @@ async function apiFetch<T>(
     try {
       const r = await fetch(url, {
         headers: { "x-apisports-key": apiKey },
-        // IMPORTANT: do not let Vercel/Next cache partial responses
         cache: "no-store",
       });
 
@@ -209,44 +218,38 @@ async function getTeamsForLeague(leagueId: number, season: number): Promise<Team
   }));
 }
 
-// League fixtures (season-aligned) with retries if response looks "too small"
-async function getLeagueFinishedFixtures(leagueId: number, season: number) {
-  // Try a couple times if we get a suspiciously small payload
-  for (let attempt = 1; attempt <= 3; attempt++) {
+// Fetch finished fixtures for BOTH current + previous season, merge, sort.
+async function getLeagueFinishedFixturesAcrossSeasons(leagueId: number, season: number) {
+  const seasonsToTry = [season, season - 1];
+
+  const all: ApiFixturesResp["response"] = [];
+
+  for (const s of seasonsToTry) {
     const r = await apiFetch<ApiFixturesResp>("/fixtures", {
       league: leagueId,
-      season,
+      season: s,
       last: 1000,
     });
+    if (!r.ok) continue;
 
-    if (!r.ok) {
-      await sleep(800 * attempt);
-      continue;
-    }
-
-    const all = r.data.response ?? [];
-    const finished = all.filter((fx) => FINISHED.has(fx.fixture.status?.short));
-
-    // If this comes back tiny, it's often a throttled/partial payload -> retry
-    if (finished.length >= 60 || attempt === 3) return finished;
-
-    await sleep(900 * attempt);
+    const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
+    all.push(...finished);
   }
 
-  return [];
+  // Dedup by fixtureId
+  const byId = new Map<number, ApiFixturesResp["response"][number]>();
+  for (const fx of all) byId.set(fx.fixture.id, fx);
+
+  return sortByDateDesc(Array.from(byId.values()));
 }
 
-// Per-team fallback (only used when league list doesn't include the team)
-async function getTeamFinishedFixtures(teamId: number, season: number) {
-  const r = await apiFetch<ApiFixturesResp>("/fixtures", {
-    team: teamId,
-    season,
-    last: 30,
-  });
+// Per-team fallback WITHOUT season (prevents season boundary blanks)
+async function getTeamFinishedFixturesNoSeason(teamId: number) {
+  const r = await apiFetch<ApiFixturesResp>("/fixtures", { team: teamId, last: 60 });
   if (!r.ok) return [];
 
-  const all = r.data.response ?? [];
-  return all.filter((fx) => FINISHED.has(fx.fixture.status?.short)).slice(0, 7);
+  const finished = (r.data.response ?? []).filter((fx) => FINISHED.has(fx.fixture.status?.short));
+  return finished.slice(0, 7);
 }
 
 async function getCornersTotal(fixtureId: number): Promise<number | null> {
@@ -256,7 +259,6 @@ async function getCornersTotal(fixtureId: number): Promise<number | null> {
   const rows = r.data.response ?? [];
   if (!rows.length) return null;
 
-  // Some responses group by team; we sum Corner Kicks across the returned rows
   const cornerVals: Array<number | null> = rows.map((row) => {
     const v = row.statistics.find((s) => s.type === "Corner Kicks")?.value ?? null;
     return statNumber(v);
@@ -300,7 +302,6 @@ async function retryNullable<T>(
 
 // ---------------- exported ----------------
 export async function getLeagueBoards(): Promise<LeagueBoard[]> {
-  // Gentle concurrency for stats/events
   const fxLimiter = createLimiter(2);
 
   const out: LeagueBoard[] = [];
@@ -329,10 +330,10 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       continue;
     }
 
-    // 1) One league fixtures call (season-aligned), but with retries
-    const leagueFinished = await getLeagueFinishedFixtures(league.leagueId, season);
+    // One league list across current+previous season (prevents season-boundary blanks)
+    const leagueFinished = await getLeagueFinishedFixturesAcrossSeasons(league.leagueId, season);
 
-    // 2) For each team: use league list, but if empty -> per-team fallback
+    // For each team: pick last 7 from league list; if none -> fallback no-season
     const perTeamFixtures = await Promise.all(
       teams.map(async (t) => {
         const fromLeague = leagueFinished
@@ -341,13 +342,12 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
 
         if (fromLeague.length > 0) return { team: t, fixtures: fromLeague };
 
-        // Fallback ONLY when league list failed to include them (prevents random blank teams)
-        const fallback = await getTeamFinishedFixtures(t.teamId, season);
+        const fallback = await getTeamFinishedFixturesNoSeason(t.teamId);
         return { team: t, fixtures: fallback };
       })
     );
 
-    // 3) Dedup fixture IDs we actually need stats for
+    // Dedup fixture IDs for stats/events
     const fixtureIdsSet = new Set<number>();
     for (const tf of perTeamFixtures) {
       for (const fx of tf.fixtures) fixtureIdsSet.add(fx.fixture.id);
@@ -360,16 +360,13 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       fixtureIds.map((fixtureId) =>
         fxLimiter(async () => {
           await sleep(120);
-
           const cornersTotal = await retryNullable(() => getCornersTotal(fixtureId), 3, 650);
           const cardsTotal = await retryNullable(() => getCardsTotal(fixtureId), 3, 650);
-
           fixtureData.set(fixtureId, { cornersTotal, cardsTotal });
         })
       )
     );
 
-    // 4) Map into TeamBoard matches (always 7 slots)
     const filledTeams: TeamBoard[] = perTeamFixtures.map(({ team, fixtures }) => {
       const real: MatchCard[] = fixtures.map((fx) => {
         const fixtureId = fx.fixture.id;
@@ -407,11 +404,11 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       teams: filledTeams,
       error:
         leagueFinished.length === 0
-          ? "League fixtures came back empty (API throttling). Using team fallback where possible."
+          ? "League fixtures returned empty; using team fallback where possible."
           : undefined,
     });
 
-    await sleep(400);
+    await sleep(300);
   }
 
   return out;
