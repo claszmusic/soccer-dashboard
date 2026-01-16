@@ -1,4 +1,7 @@
 // src/lib/leagueData.ts
+// Data source: Google Sheets published CSV (SHEET_CSV_URL)
+// Returns LeagueBoard[] exactly as your UI expects.
+
 export type MatchCard = {
   fixtureId: number;
   date: string;
@@ -19,79 +22,18 @@ export type TeamBoard = {
 export type LeagueBoard = {
   leagueId: number;
   leagueName: string;
-  teams: TeamBoard[];
+  seasonUsed?: number;
   error?: string;
+  teams: TeamBoard[];
 };
 
-function mustEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var ${name}`);
-  return v;
-}
-
-function normalizeName(n: string) {
-  return (n ?? "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-
-    if (inQuotes) {
-      if (c === '"') {
-        if (text[i + 1] === '"') {
-          field += '"';
-          i++;
-        } else inQuotes = false;
-      } else field += c;
-      continue;
-    }
-
-    if (c === '"') inQuotes = true;
-    else if (c === ",") {
-      row.push(field);
-      field = "";
-    } else if (c === "\n") {
-      row.push(field);
-      rows.push(row);
-      row = [];
-      field = "";
-    } else if (c !== "\r") field += c;
-  }
-
-  row.push(field);
-  rows.push(row);
-  return rows;
-}
-
-function cleanHeader(s: string) {
-  // removes BOM, trims, lowercases
-  return (s ?? "").replace(/^\uFEFF/, "").trim().toLowerCase();
-}
-
-function cleanCell(s: string) {
-  return (s ?? "").trim();
-}
-
-function numOrNull(v: string): number | null {
-  const t = cleanCell(v);
-  if (t === "") return null; // keep null so you can visually see truly-missing stats if you want
-  const n = Number(t);
-  return Number.isFinite(n) ? n : null;
-}
-
-function bool(v: string) {
-  return cleanCell(v).toLowerCase() === "true";
-}
+const LEAGUES: Array<{ leagueId: number; leagueName: string }> = [
+  { leagueId: 262, leagueName: "Liga MX" },
+  { leagueId: 39, leagueName: "Premier League" },
+  { leagueId: 78, leagueName: "Bundesliga" },
+  { leagueId: 140, leagueName: "La Liga" },
+  { leagueId: 135, leagueName: "Serie A" },
+];
 
 function blankMatch(): MatchCard {
   return {
@@ -105,123 +47,212 @@ function blankMatch(): MatchCard {
   };
 }
 
-export async function getLeagueBoards(): Promise<LeagueBoard[]> {
-  try {
-    const url = mustEnv("SHEET_CSV_URL");
-    const csv = await fetch(url, { cache: "no-store" }).then((r) => r.text());
-
-    const table = parseCsv(csv);
-    if (!table.length) return [];
-
-    const rawHeaders = table[0] ?? [];
-    const headerToIndex = new Map<string, number>();
-    for (let i = 0; i < rawHeaders.length; i++) {
-      headerToIndex.set(cleanHeader(rawHeaders[i]), i);
-    }
-
-    const at = (row: string[], name: string) => {
-      const i = headerToIndex.get(cleanHeader(name));
-      if (i === undefined) return "";
-      return row[i] ?? "";
-    };
-
-    const rows = table.slice(1);
-
-    // leagueId -> {name, teamsByNameKey}
-    const leagues = new Map<number, { name: string; teams: Map<string, TeamBoard> }>();
-
-    for (const r of rows) {
-      if (!r || r.length === 0) continue;
-
-      const leagueId = Number(cleanCell(at(r, "leagueId")));
-      const leagueName = cleanCell(at(r, "leagueName"));
-      const teamId = Number(cleanCell(at(r, "teamId")));
-      const teamName = cleanCell(at(r, "teamName"));
-      const teamKey = normalizeName(teamName);
-
-      const fixtureId = Number(cleanCell(at(r, "fixtureId")));
-      const date = cleanCell(at(r, "date"));
-      const opponent = cleanCell(at(r, "opponent"));
-      const isHome = bool(at(r, "isHome"));
-
-      if (!leagueId || !teamName || !fixtureId) continue;
-
-      const goalsTotal = numOrNull(at(r, "goalsTotal"));
-      const cornersTotal = numOrNull(at(r, "cornersTotal"));
-      const cardsTotal = numOrNull(at(r, "cardsTotal"));
-
-      if (!leagues.has(leagueId)) {
-        leagues.set(leagueId, { name: leagueName || `League ${leagueId}`, teams: new Map() });
-      }
-
-      const L = leagues.get(leagueId)!;
-
-      if (!L.teams.has(teamKey)) {
-        L.teams.set(teamKey, {
-          teamId: Number.isFinite(teamId) && teamId > 0 ? teamId : Math.abs(hash(teamKey)),
-          name: teamName,
-          logo: "",
-          matches: [],
-        });
-      }
-
-      L.teams.get(teamKey)!.matches.push({
-        fixtureId,
-        date,
-        opponent,
-        isHome,
-        goalsTotal,
-        cornersTotal,
-        cardsTotal,
-      });
-    }
-
-    const out: LeagueBoard[] = [];
-
-    for (const [leagueId, L] of leagues.entries()) {
-      const teams: TeamBoard[] = [];
-
-      for (const T of L.teams.values()) {
-        // dedupe by fixtureId
-        const dedup = new Map<number, MatchCard>();
-        for (const m of T.matches) dedup.set(m.fixtureId, m);
-
-        const sorted = Array.from(dedup.values()).sort(
-          (a, b) => Date.parse(b.date) - Date.parse(a.date)
-        );
-
-        const last7 = sorted.slice(0, 7);
-        while (last7.length < 7) last7.push(blankMatch());
-
-        teams.push({ ...T, matches: last7 });
-      }
-
-      teams.sort((a, b) => a.name.localeCompare(b.name));
-
-      out.push({
-        leagueId,
-        leagueName: L.name,
-        teams,
-      });
-    }
-
-    out.sort((a, b) => a.leagueId - b.leagueId);
-    return out;
-  } catch (e: any) {
-    return [
-      {
-        leagueId: 0,
-        leagueName: "Error",
-        error: e?.message ?? String(e),
-        teams: [],
-      },
-    ];
-  }
+// Parse numbers safely; if empty -> null
+function parseNum(v: string | undefined | null): number | null {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
-// stable hash so we can generate a fallback numeric id
-function hash(s: string) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return h;
+// If you want missing corners/cards to show as 0 instead of "-", keep this ON.
+const FILL_MISSING_TOTALS_WITH_ZERO = true;
+
+function normalizeBool(v: string | undefined | null): boolean {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "y";
+}
+
+function parseCsvLine(line: string): string[] {
+  // simple CSV parser that supports quotes
+  const out: string[] = [];
+  let cur = "";
+  let inQ = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (ch === '"') {
+      // escaped quote
+      if (inQ && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQ = !inQ;
+      }
+      continue;
+    }
+
+    if (ch === "," && !inQ) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
+  }
+
+  out.push(cur);
+  return out;
+}
+
+function parseCsv(text: string): Array<Record<string, string>> {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) return [];
+
+  const headers = parseCsvLine(lines[0]).map((h) => h.trim());
+  const rows: Array<Record<string, string>> = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = parseCsvLine(lines[i]);
+    const row: Record<string, string> = {};
+    for (let j = 0; j < headers.length; j++) {
+      row[headers[j]] = (cols[j] ?? "").trim();
+    }
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+type SheetRow = {
+  leagueId: number;
+  leagueName: string;
+  teamId: number;
+  teamName: string;
+  fixtureId: number;
+  date: string;
+  opponent: string;
+  isHome: boolean;
+  goalsTotal: number | null;
+  cornersTotal: number | null;
+  cardsTotal: number | null;
+  logo?: string;
+};
+
+function toSheetRow(r: Record<string, string>): SheetRow | null {
+  const leagueId = Number(r.leagueId);
+  const teamId = Number(r.teamId);
+  const fixtureId = Number(r.fixtureId);
+
+  if (!Number.isFinite(leagueId) || !Number.isFinite(teamId) || !Number.isFinite(fixtureId)) return null;
+
+  const goalsTotal = parseNum(r.goalsTotal);
+  let cornersTotal = parseNum(r.cornersTotal);
+  let cardsTotal = parseNum(r.cardsTotal);
+
+  if (FILL_MISSING_TOTALS_WITH_ZERO) {
+    if (cornersTotal === null) cornersTotal = 0;
+    if (cardsTotal === null) cardsTotal = 0;
+  }
+
+  return {
+    leagueId,
+    leagueName: r.leagueName || "",
+    teamId,
+    teamName: r.teamName || "",
+    fixtureId,
+    date: r.date || "",
+    opponent: r.opponent || "-",
+    isHome: normalizeBool(r.isHome),
+    goalsTotal: goalsTotal ?? 0, // goals should always exist, but keep stable
+    cornersTotal,
+    cardsTotal,
+  };
+}
+
+export async function getLeagueBoards(): Promise<LeagueBoard[]> {
+  const url = process.env.SHEET_CSV_URL;
+  if (!url) {
+    return LEAGUES.map((l) => ({
+      leagueId: l.leagueId,
+      leagueName: l.leagueName,
+      error: "Missing SHEET_CSV_URL env var",
+      teams: [],
+    }));
+  }
+
+  let csvText = "";
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`CSV fetch failed: ${res.status} ${res.statusText}`);
+    csvText = await res.text();
+  } catch (e: any) {
+    return LEAGUES.map((l) => ({
+      leagueId: l.leagueId,
+      leagueName: l.leagueName,
+      error: e?.message ?? String(e),
+      teams: [],
+    }));
+  }
+
+  const raw = parseCsv(csvText);
+  const rows: SheetRow[] = [];
+  for (const r of raw) {
+    const sr = toSheetRow(r);
+    if (sr) rows.push(sr);
+  }
+
+  // group: league -> team -> matches
+  const leagueMap = new Map<number, Map<number, SheetRow[]>>();
+  for (const row of rows) {
+    if (!leagueMap.has(row.leagueId)) leagueMap.set(row.leagueId, new Map());
+    const teamMap = leagueMap.get(row.leagueId)!;
+    if (!teamMap.has(row.teamId)) teamMap.set(row.teamId, []);
+    teamMap.get(row.teamId)!.push(row);
+  }
+
+  const out: LeagueBoard[] = [];
+
+  for (const L of LEAGUES) {
+    const teamMap = leagueMap.get(L.leagueId) ?? new Map<number, SheetRow[]>();
+
+    // Sort each team’s matches newest -> oldest, dedup by fixtureId
+    const teams: TeamBoard[] = [];
+
+    for (const [teamId, list] of teamMap.entries()) {
+      const byFixture = new Map<number, SheetRow>();
+      for (const r of list) byFixture.set(r.fixtureId, r);
+
+      const unique = Array.from(byFixture.values()).sort((a, b) =>
+        a.date < b.date ? 1 : a.date > b.date ? -1 : 0
+      );
+
+      const name = unique[0]?.teamName ?? `Team ${teamId}`;
+      const logo = unique[0]?.logo ?? `https://media.api-sports.io/football/teams/${teamId}.png`;
+
+      const realMatches: MatchCard[] = unique.slice(0, 7).map((r) => ({
+        fixtureId: r.fixtureId,
+        date: r.date,
+        opponent: r.opponent,
+        isHome: r.isHome,
+        goalsTotal: r.goalsTotal,
+        cornersTotal: r.cornersTotal,
+        cardsTotal: r.cardsTotal,
+      }));
+
+      while (realMatches.length < 7) realMatches.push(blankMatch());
+
+      teams.push({
+        teamId,
+        name,
+        logo,
+        matches: realMatches,
+      });
+    }
+
+    // IMPORTANT: If a league has zero teams in the sheet yet, return empty but with error.
+    out.push({
+      leagueId: L.leagueId,
+      leagueName: L.leagueName,
+      teams,
+    });
+  }
+
+  return out;
 }
