@@ -1,5 +1,4 @@
 // src/lib/leagues.ts
-
 export type LeagueConfig = { id: number; name: string };
 
 export const LEAGUES: LeagueConfig[] = [
