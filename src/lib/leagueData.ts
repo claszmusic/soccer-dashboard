@@ -5,9 +5,9 @@ export type MatchCard = {
   date: string;
   opponent: string;
   isHome: boolean;
-  goalsTotal: number | null;
-  cornersTotal: number | null;
-  cardsTotal: number | null;
+  goalsTotal: number;
+  cornersTotal: number;
+  cardsTotal: number;
 };
 
 export type TeamBoard = {
@@ -52,9 +52,7 @@ function parseCsv(text: string): string[][] {
         if (text[i + 1] === '"') {
           field += '"';
           i++;
-        } else {
-          inQuotes = false;
-        }
+        } else inQuotes = false;
       } else field += c;
       continue;
     }
@@ -78,7 +76,7 @@ function parseCsv(text: string): string[][] {
 
 function num(v: string) {
   const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? n : 0;
 }
 
 function bool(v: string) {
@@ -91,9 +89,9 @@ function blankMatch(): MatchCard {
     date: "",
     opponent: "-",
     isHome: true,
-    goalsTotal: null,
-    cornersTotal: null,
-    cardsTotal: null,
+    goalsTotal: 0,
+    cornersTotal: 0,
+    cardsTotal: 0,
   };
 }
 
@@ -124,11 +122,11 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       const opponent = r[idx("opponent")];
       const isHome = bool(r[idx("isHome")]);
 
+      if (!leagueId || !teamName || !fixtureId) continue;
+
       const goalsTotal = num(r[idx("goalsTotal")]);
       const cornersTotal = num(r[idx("cornersTotal")]);
       const cardsTotal = num(r[idx("cardsTotal")]);
-
-      if (!leagueId || !teamName || !fixtureId) continue;
 
       if (!leagues.has(leagueId)) {
         leagues.set(leagueId, { name: leagueName, teams: new Map() });
