@@ -5,7 +5,8 @@
 // - Fetch league fixtures for season + (season-1), merge, sort newest -> oldest
 // - Build alias mapping from fixtures to resolve "effectiveTeamId" when /teams IDs don't match fixture IDs
 // - Match fixtures by: effectiveTeamId OR original teamId OR fuzzy name match
-// - Team fallback fetch tries BOTH IDs (original + effective) without season to prevent blanks
+// - If a team still gets 0 fixtures, FORCE-SWAP to fixture teamId found by name (this fixes Toluca/Monterrey/Tijuana blanks)
+// - Team fallback fetch tries ALL known IDs without season to prevent blanks
 // - Corners/cards cached 24h so they don't disappear on refresh
 // - Fixtures/teams/leagues remain no-store to avoid Vercel caching partial payloads
 
@@ -119,7 +120,7 @@ function normName(s: string) {
   return (s ?? "")
     .toLowerCase()
     .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 }
@@ -147,11 +148,10 @@ function nameMatches(a: string, b: string) {
   const overlapA = common / ta.size;
   const overlapB = common / tb.size;
 
-  // allow fairly forgiving overlap (club names can be long)
   return overlapA >= 0.6 || overlapB >= 0.6;
 }
 
-// ---------------- API fetch (supports cached stats/events) ----------------
+// ---------------- API fetch ----------------
 async function apiFetch<T>(
   path: string,
   params: Record<string, string | number | boolean | undefined> = {},
@@ -290,7 +290,7 @@ async function getLeagueFinishedFixturesAcrossSeasons(leagueId: number, season: 
 async function getTeamFinishedFixturesNoSeason(teamId: number) {
   const r = await apiFetch<ApiFixturesResp>(
     "/fixtures",
-    { team: teamId, last: 90 },
+    { team: teamId, last: 120 },
     { cacheMode: "no-store" }
   );
   if (!r.ok) return [];
@@ -299,7 +299,7 @@ async function getTeamFinishedFixturesNoSeason(teamId: number) {
   return finished.slice(0, 7);
 }
 
-// Corners cached 24h (so they don't disappear)
+// Corners cached 24h
 async function getCornersTotal(fixtureId: number): Promise<number | null> {
   const r = await apiFetch<ApiFixtureStatsResp>(
     "/fixtures/statistics",
@@ -319,7 +319,7 @@ async function getCornersTotal(fixtureId: number): Promise<number | null> {
   return sumNumbers(cornerVals);
 }
 
-// Cards cached 24h (so they don't disappear)
+// Cards cached 24h
 async function getCardsTotal(fixtureId: number): Promise<number | null> {
   const r = await apiFetch<ApiEventsResp>(
     "/fixtures/events",
@@ -357,7 +357,7 @@ async function retryNullable<T>(
   return null;
 }
 
-// Build alias map: teamName -> set(ids found in fixtures)
+// Build alias map: normalized teamName -> set(ids found in fixtures)
 function buildFixtureAliasIndex(leagueFixtures: ApiFixturesResp["response"]) {
   const nameToIds = new Map<string, Set<number>>();
 
@@ -377,27 +377,24 @@ function buildFixtureAliasIndex(leagueFixtures: ApiFixturesResp["response"]) {
   return nameToIds;
 }
 
-// Resolve effective team IDs for each team:
-// - start with original teamId
-// - if fixtures show same team name (or close match) with another id, include it
-function resolveEffectiveIds(
-  team: TeamBoard,
-  aliasIndex: Map<string, Set<number>>
-): number[] {
+// Resolve effective team IDs for each team (original + any fixture IDs that match its name)
+function resolveEffectiveIds(team: TeamBoard, aliasIndex: Map<string, Set<number>>): number[] {
   const ids = new Set<number>([team.teamId]);
 
   const teamNameNorm = normName(team.name);
 
-  // Exact normalized key hit
+  // Exact normalized match first
   const exact = aliasIndex.get(teamNameNorm);
-  if (exact) for (const id of exact) ids.add(id);
+  if (exact && exact.size > 0) {
+    for (const id of exact) ids.add(id);
+    return Array.from(ids);
+  }
 
-  // Fuzzy scan (only if exact didn't find anything)
-  if (!exact || exact.size === 0) {
-    for (const [fxNameNorm, idSet] of aliasIndex.entries()) {
-      if (nameMatches(teamNameNorm, fxNameNorm)) {
-        for (const id of idSet) ids.add(id);
-      }
+  // Otherwise: fuzzy scan and grab the first matching set
+  for (const [fxNameNorm, idSet] of aliasIndex.entries()) {
+    if (nameMatches(teamNameNorm, fxNameNorm)) {
+      for (const id of idSet) ids.add(id);
+      break;
     }
   }
 
@@ -405,18 +402,10 @@ function resolveEffectiveIds(
 }
 
 // Match fixture to team using ids OR name fallback
-function teamInFixture(
-  team: TeamBoard,
-  effectiveIds: number[],
-  fx: ApiFixturesResp["response"][number]
-) {
+function teamInFixture(team: TeamBoard, effectiveIds: number[], fx: ApiFixturesResp["response"][number]) {
   if (effectiveIds.includes(fx.teams.home.id) || effectiveIds.includes(fx.teams.away.id)) return true;
 
-  // name fallback
-  return (
-    nameMatches(team.name, fx.teams.home.name) ||
-    nameMatches(team.name, fx.teams.away.name)
-  );
+  return nameMatches(team.name, fx.teams.home.name) || nameMatches(team.name, fx.teams.away.name);
 }
 
 // Determine isHome reliably: prefer id match, fallback to name
@@ -424,69 +413,68 @@ function computeIsHome(team: TeamBoard, effectiveIds: number[], fx: ApiFixturesR
   if (effectiveIds.includes(fx.teams.home.id)) return true;
   if (effectiveIds.includes(fx.teams.away.id)) return false;
 
-  // fallback: name match
   if (nameMatches(team.name, fx.teams.home.name)) return true;
   if (nameMatches(team.name, fx.teams.away.name)) return false;
 
-  // last resort
   return true;
 }
 
 // ---------------- exported ----------------
 export async function getLeagueBoards(): Promise<LeagueBoard[]> {
   const fxLimiter = createLimiter(2);
-
   const out: LeagueBoard[] = [];
 
   for (const league of LEAGUES) {
     const season = await getCurrentSeason(league.leagueId);
     if (!season) {
-      out.push({
-        leagueId: league.leagueId,
-        leagueName: league.leagueName,
-        error: "Could not resolve season.",
-        teams: [],
-      });
+      out.push({ leagueId: league.leagueId, leagueName: league.leagueName, error: "Could not resolve season.", teams: [] });
       continue;
     }
 
     const teams = await getTeamsForLeague(league.leagueId, season);
     if (!teams || teams.length === 0) {
-      out.push({
-        leagueId: league.leagueId,
-        leagueName: league.leagueName,
-        seasonUsed: season,
-        error: "Could not load teams.",
-        teams: [],
-      });
+      out.push({ leagueId: league.leagueId, leagueName: league.leagueName, seasonUsed: season, error: "Could not load teams.", teams: [] });
       continue;
     }
 
     const leagueFinished = await getLeagueFinishedFixturesAcrossSeasons(league.leagueId, season);
     const aliasIndex = buildFixtureAliasIndex(leagueFinished);
 
-    // Resolve effective IDs per team (this is what fixes “some teams blank”)
-    const teamEffectiveIds = new Map<number, number[]>(); // key: original teamId
-    for (const t of teams) {
-      teamEffectiveIds.set(t.teamId, resolveEffectiveIds(t, aliasIndex));
-    }
+    const teamEffectiveIds = new Map<number, number[]>();
+    for (const t of teams) teamEffectiveIds.set(t.teamId, resolveEffectiveIds(t, aliasIndex));
 
-    // For each team: pick last 7 from league list using effective IDs; if empty -> fallback try both IDs
+    // For each team: take last 7 from league fixtures; if 0, FORCE-SWAP to fixture ID found by name
     const perTeamFixtures = await Promise.all(
       teams.map(async (t) => {
         const ids = teamEffectiveIds.get(t.teamId) ?? [t.teamId];
 
-        const fromLeague = leagueFinished.filter((fx) => teamInFixture(t, ids, fx)).slice(0, 7);
-        if (fromLeague.length > 0) return { team: t, effectiveIds: ids, fixtures: fromLeague };
+        let fromLeague = leagueFinished.filter((fx) => teamInFixture(t, ids, fx)).slice(0, 7);
 
-        // fallback: try all ids (original + any resolved from fixtures)
-        const merged: ApiFixturesResp["response"] = [];
-        for (const id of ids) {
-          const f = await getTeamFinishedFixturesNoSeason(id);
-          merged.push(...f);
+        // ✅ FORCE-SWAP if empty: steal ID from fixtures by name match
+        if (fromLeague.length === 0) {
+          const tNorm = normName(t.name);
+          const hit = leagueFinished.find(
+            (fx) => nameMatches(tNorm, fx.teams.home.name) || nameMatches(tNorm, fx.teams.away.name)
+          );
+
+          if (hit) {
+            const swappedId = nameMatches(tNorm, hit.teams.home.name) ? hit.teams.home.id : hit.teams.away.id;
+            const swappedIds = Array.from(new Set([t.teamId, swappedId]));
+
+            fromLeague = leagueFinished.filter((fx) => teamInFixture(t, swappedIds, fx)).slice(0, 7);
+
+            if (fromLeague.length > 0) {
+              return { team: t, effectiveIds: swappedIds, fixtures: fromLeague };
+            }
+          }
         }
 
-        // dedup by fixtureId and sort newest->oldest
+        if (fromLeague.length > 0) return { team: t, effectiveIds: ids, fixtures: fromLeague };
+
+        // Fallback: no-season fetch for all ids
+        const merged: ApiFixturesResp["response"] = [];
+        for (const id of ids) merged.push(...(await getTeamFinishedFixturesNoSeason(id)));
+
         const byId = new Map<number, ApiFixturesResp["response"][number]>();
         for (const fx of merged) byId.set(fx.fixture.id, fx);
 
@@ -497,9 +485,7 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
 
     // Dedup fixture IDs for stats/events
     const fixtureIdsSet = new Set<number>();
-    for (const tf of perTeamFixtures) {
-      for (const fx of tf.fixtures) fixtureIdsSet.add(fx.fixture.id);
-    }
+    for (const tf of perTeamFixtures) for (const fx of tf.fixtures) fixtureIdsSet.add(fx.fixture.id);
     const fixtureIds = [...fixtureIdsSet];
 
     const fixtureData = new Map<number, { cornersTotal: number | null; cardsTotal: number | null }>();
@@ -546,13 +532,7 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       return { ...team, matches };
     });
 
-    out.push({
-      leagueId: league.leagueId,
-      leagueName: league.leagueName,
-      seasonUsed: season,
-      teams: filledTeams,
-    });
-
+    out.push({ leagueId: league.leagueId, leagueName: league.leagueName, seasonUsed: season, teams: filledTeams });
     await sleep(200);
   }
 
