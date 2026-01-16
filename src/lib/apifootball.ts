@@ -1,54 +1,34 @@
-type CacheEntry<T> = { t: number; v: T };
-const mem = new Map<string, CacheEntry<any>>();
-
+// src/lib/apifootball.ts
 export async function apiFootball<T>(
   path: string,
-  params: Record<string, any>,
-  ttlSeconds = 0
+  params: Record<string, string | number | boolean | undefined> = {}
 ): Promise<T> {
-  const key = `${path}?${new URLSearchParams(
-    Object.entries(params).reduce<Record<string, string>>((acc, [k, v]) => {
-      if (v === undefined || v === null) return acc;
-      acc[k] = String(v);
-      return acc;
-    }, {})
-  ).toString()}`;
+  const key = process.env.APISPORTS_KEY;
 
-  const useCache = ttlSeconds > 0;
-  if (useCache) {
-    const hit = mem.get(key);
-    if (hit && Date.now() - hit.t < ttlSeconds * 1000) return hit.v;
+  if (!key) {
+    throw new Error("Missing APISPORTS_KEY env var. Add it in Vercel Project → Settings → Environment Variables.");
   }
 
-  const apiKey = process.env.APISPORTS_KEY;
-  if (!apiKey) {
-    throw new Error("Missing APISPORTS_KEY in environment variables (Vercel Settings → Env Vars).");
+  const url = new URL(`https://v3.football.api-sports.io${path}`);
+
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined) continue;
+    url.searchParams.set(k, String(v));
   }
 
-  const url = `https://v3.football.api-sports.io${key}`;
-
-  const res = await fetch(url, {
+  const res = await fetch(url.toString(), {
     method: "GET",
     headers: {
-      "x-apisports-key": apiKey,
+      "x-apisports-key": key,
     },
-    // IMPORTANT: avoid Next.js caching a failed response
+    // IMPORTANT: prevent Next caching
     cache: "no-store",
   });
 
-  const text = await res.text();
-  let json: any;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`API-Football non-JSON response (${res.status}): ${text.slice(0, 200)}`);
-  }
-
   if (!res.ok) {
-    const msg = json?.errors ? JSON.stringify(json.errors) : json?.message || text;
-    throw new Error(`API-Football error ${res.status}: ${msg}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`API-Football error ${res.status}: ${text.slice(0, 200)}`);
   }
 
-  if (useCache) mem.set(key, { t: Date.now(), v: json });
-  return json as T;
+  return (await res.json()) as T;
 }
