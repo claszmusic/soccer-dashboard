@@ -21,7 +21,6 @@ export type LeagueBoard = {
 function n(v: any) {
   return typeof v === "number" ? v : 0;
 }
-
 function stat(stats: Array<{ type: string; value: number | null }>, type: string) {
   const v = stats.find((s) => s.type === type)?.value;
   return typeof v === "number" ? v : 0;
@@ -39,32 +38,60 @@ async function resolveLeagueAndSeason(leagueName: string, country: string) {
   const item = data.response?.[0];
   const leagueId = item?.league?.id;
 
-  // Pick the most recent season year (prefer current=true, else highest year)
   const seasons = item?.seasons ?? [];
   const current = seasons.find((s) => s.current);
+  const allYears = seasons.map((s) => s.year).sort((a, b) => b - a);
+
   const seasonYear =
     current?.year ??
-    seasons.map((s) => s.year).sort((a, b) => b - a)[0] ??
+    allYears[0] ??
     new Date().getFullYear();
 
   if (!leagueId) return null;
 
-  return { leagueId, seasonYear };
+  // We’ll keep a list of season years to try (current, then older)
+  const seasonCandidates = [seasonYear, ...allYears.filter((y) => y !== seasonYear)].slice(0, 5);
+
+  return { leagueId, seasonYear, seasonCandidates };
+}
+
+async function getLastFTFixturesWithFallback(opts: {
+  teamId: number;
+  seasonCandidates: number[];
+  columns: number;
+}) {
+  const { teamId, seasonCandidates, columns } = opts;
+
+  for (const y of seasonCandidates) {
+    const fixtures = await apiFootball<{
+      response: Array<{
+        fixture: { id: number };
+        teams: { home: { id: number; name: string }; away: { id: number; name: string } };
+        goals: { home: number | null; away: number | null };
+      }>;
+    }>("/fixtures", { team: teamId, season: y, status: "FT", last: columns }, 60 * 10);
+
+    if ((fixtures.response ?? []).length > 0) {
+      return { seasonUsed: y, fixtures: fixtures.response };
+    }
+  }
+
+  return { seasonUsed: seasonCandidates[0] ?? new Date().getFullYear(), fixtures: [] as any[] };
 }
 
 export async function buildLeagueBoard(opts: {
   leagueName: string;
   country: string;
-  columns?: number; // default 7
+  columns?: number;
 }): Promise<LeagueBoard> {
   const { leagueName, country, columns = 7 } = opts;
 
   const resolved = await resolveLeagueAndSeason(leagueName, country);
   if (!resolved) return { leagueTitle: leagueName, season: new Date().getFullYear(), rows: [] };
 
-  const { leagueId, seasonYear } = resolved;
+  const { leagueId, seasonYear, seasonCandidates } = resolved;
 
-  // 1) Get all teams in that league + season
+  // teams from the “main” season
   const teams = await apiFootball<{
     response: Array<{ team: { id: number; name: string } }>;
   }>("/teams", { league: leagueId, season: seasonYear }, 60 * 60 * 12);
@@ -80,19 +107,17 @@ export async function buildLeagueBoard(opts: {
 
   const rows: LeagueBoard["rows"] = [];
 
-  // 2) For each team: last 7 FT fixtures (no matter the date)
   for (const team of teamList) {
-    const fixtures = await apiFootball<{
-      response: Array<{
-        fixture: { id: number };
-        teams: { home: { id: number; name: string }; away: { id: number; name: string } };
-        goals: { home: number | null; away: number | null };
-      }>;
-    }>("/fixtures", { team: team.id, season: seasonYear, status: "FT", last: columns }, 60 * 15);
+    // ✅ Get last FT matches even if we must fallback to older seasons
+    const { fixtures } = await getLastFTFixturesWithFallback({
+      teamId: team.id,
+      seasonCandidates,
+      columns,
+    });
 
     const cells: MatchCell[] = [];
 
-    for (const fx of fixtures.response ?? []) {
+    for (const fx of fixtures) {
       const fixtureId = fx.fixture?.id;
       if (!fixtureId) continue;
 
@@ -104,10 +129,10 @@ export async function buildLeagueBoard(opts: {
       const opponentName = isHome ? away.name : home.name;
       const opponent = `${opponentName} (${isHome ? "H" : "A"})`;
 
-      // TOTAL goals (home+away)
+      // TOTAL goals
       const gTotal = n(fx.goals?.home) + n(fx.goals?.away);
 
-      // 3) Stats: corners + cards for BOTH teams, summed (home+away)
+      // Stats for BOTH teams summed (home+away)
       const stats = await apiFootball<{
         response: Array<{
           team: { id: number };
@@ -126,7 +151,7 @@ export async function buildLeagueBoard(opts: {
       cells.push({ fixtureId, opponent, g: gTotal, ck: ckTotal, c: cTotal });
     }
 
-    // Keep columns fixed (always 7). If not enough matches, fill blanks.
+    // Keep columns fixed
     while (cells.length < columns) cells.push({});
 
     rows.push({
