@@ -104,7 +104,7 @@ async function getCurrentSeason(leagueId: number): Promise<ApiResult<number>> {
   const fallback = seasons.map((s) => s.year).sort((a, b) => b - a)[0];
   const year = current ?? fallback;
 
-  if (!year) return { ok: false, error: `No seasons found for league ${leagueId}` };
+if (!year) return { ok: false, error: `No seasons found for league ${leagueId}` };
   return { ok: true, data: year };
 }
 
