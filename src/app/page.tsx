@@ -62,7 +62,7 @@ function countBlankTeams(leagues: LeagueBoard[]) {
 }
 
 async function fetchBoardsOnce(): Promise<LeagueBoard[]> {
-  const r = await fetch("/api/leagueBoards", { cache: "no-store" });
+const r = await fetch("/api/leagueboards", { cache: "no-store" });
   const j = await r.json();
   if (!j?.ok) throw new Error(j?.error ?? "Failed to load league boards");
   return j.leagues as LeagueBoard[];
