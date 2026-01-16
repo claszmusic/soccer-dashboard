@@ -7,9 +7,9 @@ type MatchCard = {
   date: string;
   opponent: string;
   isHome: boolean;
-  goalsTotal: number | null;
-  cornersTotal: number | null;
-  cardsTotal: number | null;
+  goalsTotal: number;   // always a number
+  cornersTotal: number; // always a number
+  cardsTotal: number;   // always a number
 };
 
 type TeamBoard = {
@@ -47,14 +47,16 @@ function cornersClass(ck: number) {
 }
 
 function isBlankMatch(m: MatchCard | null) {
-  return !m || m.fixtureId === 0;
+  // a match is "blank" only if it truly doesn't exist
+  return !m || !m.fixtureId;
 }
 
 function countBlankTeams(leagues: LeagueBoard[]) {
   let blanks = 0;
   for (const l of leagues) {
     for (const t of l.teams ?? []) {
-      const allBlank = (t.matches ?? []).every((m) => m.fixtureId === 0);
+      const slots = Array.from({ length: 7 }).map((_, i) => t.matches?.[i] ?? null);
+      const allBlank = slots.every((m) => isBlankMatch(m));
       if (allBlank) blanks++;
     }
   }
@@ -62,7 +64,7 @@ function countBlankTeams(leagues: LeagueBoard[]) {
 }
 
 async function fetchBoardsOnce(): Promise<LeagueBoard[]> {
-const r = await fetch("/api/leagueboards", { cache: "no-store" });
+  const r = await fetch("/api/leagueboards", { cache: "no-store" });
   const j = await r.json();
   if (!j?.ok) throw new Error(j?.error ?? "Failed to load league boards");
   return j.leagues as LeagueBoard[];
@@ -78,8 +80,8 @@ async function fetchBoardsTryUntilComplete(opts?: {
   delayMs?: number;
   backoff?: boolean;
 }): Promise<{ leagues: LeagueBoard[]; tries: number; complete: boolean }> {
-  const maxMs = opts?.maxMs ?? 25_000;    // up to 25s total
-  const delayMs = opts?.delayMs ?? 900;  // initial delay between tries
+  const maxMs = opts?.maxMs ?? 25_000; // up to 25s total
+  const delayMs = opts?.delayMs ?? 900; // initial delay between tries
   const backoff = opts?.backoff ?? true;
 
   const start = Date.now();
@@ -225,6 +227,7 @@ export default function Page() {
                           const title = blank ? "-" : `${m!.opponent} (${m!.isHome ? "H" : "A"})`;
                           const date = blank ? "" : m!.date.slice(0, 10);
 
+                          // IMPORTANT: if match exists, these are ALWAYS numbers (0 allowed)
                           const g = blank ? null : m!.goalsTotal;
                           const ck = blank ? null : m!.cornersTotal;
                           const c = blank ? null : m!.cardsTotal;
@@ -243,7 +246,7 @@ export default function Page() {
                                   <div className="text-gray-700 font-semibold">CK</div>
                                   <div
                                     className={
-                                      ck === null || ck === undefined
+                                      ck === null
                                         ? "text-gray-400 text-right"
                                         : `${cornersClass(ck)} text-right font-semibold`
                                     }
@@ -254,7 +257,7 @@ export default function Page() {
                                   <div className="text-gray-700 font-semibold">G</div>
                                   <div
                                     className={
-                                      g === null || g === undefined
+                                      g === null
                                         ? "text-gray-400 text-right"
                                         : `${goalsClass(g)} text-right font-semibold`
                                     }
@@ -265,7 +268,7 @@ export default function Page() {
                                   <div className="text-gray-700 font-semibold">C</div>
                                   <div
                                     className={
-                                      c === null || c === undefined
+                                      c === null
                                         ? "text-gray-400 text-right"
                                         : `${cardsClass(c)} text-right font-semibold`
                                     }
