@@ -1,374 +1,317 @@
 // src/lib/leagueData.ts
-// Stable league data loader for API-Football (APISports)
-//
-// Goals: show last 7 FINISHED matches per team (across season boundaries),
-// compute totals (home+away combined) for goals, corners, cards,
-// NEVER drop matches if stats/events missing, and reduce disappearing data with caching.
-
-export type LeagueBoard = {
-  ok: boolean;
-  data: LeagueBlock[];
-  error?: string;
-};
-
-export type LeagueBlock = {
-  leagueId: number;
-  leagueName: string;
-  seasonUsed: number;
-  teams: TeamBlock[];
-};
-
-export type TeamBlock = {
-  teamId: number;
-  name: string;
-  logo: string;
-  matches: MatchRow[];
-};
-
-export type MatchRow = {
+type MatchCard = {
   fixtureId: number;
   date: string;
   opponent: string;
   isHome: boolean;
   goalsTotal: number;
-  cornersTotal: number; // always a number (0 if missing)
-  cardsTotal: number; // always a number (0 if missing)
+  cornersTotal: number;
+  cardsTotal: number;
 };
 
-const API_BASE = "https://v3.football.api-sports.io";
-const DAY_SECONDS = 60 * 60 * 24;
-
-const APISPORTS_KEY = process.env.APISPORTS_KEY;
-
-// ---- simple in-memory cache (best-effort; Vercel serverless may reset) ----
-type CacheEntry<T> = { exp: number; val: T };
-const memCache = new Map<string, CacheEntry<any>>();
-
-function memGet<T>(key: string): T | null {
-  const hit = memCache.get(key);
-  if (!hit) return null;
-  if (Date.now() > hit.exp) {
-    memCache.delete(key);
-    return null;
-  }
-  return hit.val as T;
-}
-function memSet<T>(key: string, val: T, ttlSeconds: number) {
-  memCache.set(key, { val, exp: Date.now() + ttlSeconds * 1000 });
-}
-
-// ---- throttling (keep requests gentle) ----
-let lastRequestAt = 0;
-async function throttle(ms = 220) {
-  const now = Date.now();
-  const wait = Math.max(0, lastRequestAt + ms - now);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  lastRequestAt = Date.now();
-}
-
-// ---- fetch with 429 retry ----
-async function apiFetchJson<T>(
-  path: string,
-  opts: {
-    cacheMode?: RequestCache; // "no-store" or default
-    revalidateSeconds?: number; // next.js cache for fetch
-    retries?: number;
-  } = {}
-): Promise<T> {
-  if (!APISPORTS_KEY) {
-    throw new Error("Missing env var APISPORTS_KEY");
-  }
-
-  const url = `${API_BASE}${path}`;
-  const retries = opts.retries ?? 3;
-
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    await throttle(220);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "x-apisports-key": APISPORTS_KEY,
-      },
-      cache: opts.cacheMode,
-      next: opts.revalidateSeconds ? { revalidate: opts.revalidateSeconds } : undefined,
-    });
-
-    if (res.status === 429 && attempt < retries) {
-      // exponential backoff
-      const backoff = 400 * Math.pow(2, attempt);
-      await new Promise((r) => setTimeout(r, backoff));
-      continue;
-    }
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`API ${res.status} ${res.statusText} for ${path} :: ${text.slice(0, 200)}`);
-    }
-
-    return (await res.json()) as T;
-  }
-
-  // should never reach
-  throw new Error(`Failed to fetch ${path}`);
-}
-
-function currentSeasonGuess(): number {
-  // Soccer seasons: many leagues run across years.
-  // API-Football expects a "season" like 2025, 2026, etc (start year of season).
-  // We'll just start from the current year, then walk backwards until we collect 7 finished matches.
-  return new Date().getUTCFullYear();
-}
-
-// ---- API types (partial) ----
-type ApiResponse<T> = { response: T };
-
-type ApiTeam = {
-  team: { id: number; name: string; logo: string };
-};
-
-type ApiFixture = {
-  fixture: { id: number; date: string; status: { short: string } };
-  teams: {
-    home: { id: number; name: string };
-    away: { id: number; name: string };
-  };
-  goals: { home: number | null; away: number | null };
-};
-
-type ApiStatRow = {
-  type: string;
-  value: number | string | null;
-};
-
-type ApiFixtureStatistics = {
-  team: { id: number; name: string };
-  statistics: ApiStatRow[];
-};
-
-type ApiEvent = {
-  type: string; // "Card", "Goal", ...
-  detail: string; // "Yellow Card", "Red Card", etc
-};
-
-// ---- helpers to parse corners/cards ----
-function toNumber(v: unknown): number | null {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  if (typeof v === "string") {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
-}
-
-function pickCornerKicks(stats: ApiStatRow[]): number {
-  // API-Football uses type like "Corner Kicks"
-  const row = stats.find((s) => s.type.toLowerCase() === "corner kicks");
-  const n = toNumber(row?.value);
-  return n ?? 0;
-}
-
-function countCards(events: ApiEvent[]): number {
-  // Count all card events (yellow, 2nd yellow, red)
-  let count = 0;
-  for (const e of events) {
-    if (e.type?.toLowerCase() === "card") count += 1;
-  }
-  return count;
-}
-
-// ---- cached per-fixture corners/cards ----
-async function getCornersTotal(fixtureId: number): Promise<number> {
-  const key = `stats:${fixtureId}`;
-  const cached = memGet<number>(key);
-  if (cached !== null) return cached;
-
-  try {
-    // cache these calls for 24h to avoid disappearing stats
-    const json = await apiFetchJson<ApiResponse<ApiFixtureStatistics[]>>(
-      `/fixtures/statistics?fixture=${fixtureId}`,
-      { revalidateSeconds: DAY_SECONDS, retries: 3 }
-    );
-
-    const blocks = json.response ?? [];
-    let total = 0;
-    for (const b of blocks) {
-      total += pickCornerKicks(b.statistics ?? []);
-    }
-
-    // always set a number
-    memSet(key, total, DAY_SECONDS);
-    return total;
-  } catch {
-    // on any error, NEVER fail the match; just return 0
-    memSet(key, 0, 60 * 10); // short cache (10m) to avoid hammering when failing
-    return 0;
-  }
-}
-
-async function getCardsTotal(fixtureId: number): Promise<number> {
-  const key = `events:${fixtureId}`;
-  const cached = memGet<number>(key);
-  const cachedNull = memGet<"__0__">(key + ":z"); // marker to avoid re-fetch storm
-  if (cached !== null) return cached;
-  if (cachedNull) return 0;
-
-  try {
-    const json = await apiFetchJson<ApiResponse<ApiEvent[]>>(`/fixtures/events?fixture=${fixtureId}`, {
-      revalidateSeconds: DAY_SECONDS,
-      retries: 3,
-    });
-
-    const events = json.response ?? [];
-    const total = countCards(events);
-
-    memSet(key, total, DAY_SECONDS);
-    return total;
-  } catch {
-    memSet(key + ":z", "__0__", 60 * 10);
-    return 0;
-  }
-}
-
-// ---- fixtures: last 7 finished across seasons ----
-async function fetchFinishedFixturesForTeamSeason(args: {
-  leagueId: number;
-  season: number;
+type TeamBoard = {
   teamId: number;
-}): Promise<ApiFixture[]> {
-  const { leagueId, season, teamId } = args;
+  name: string;
+  logo: string;
+  matches: MatchCard[];
+};
 
-  const json = await apiFetchJson<ApiResponse<ApiFixture[]>>(
-    `/fixtures?league=${leagueId}&season=${season}&team=${teamId}&status=FT`,
-    { cacheMode: "no-store", retries: 3 }
-  );
+type LeagueBoard = {
+  leagueId: number;
+  leagueName: string;
+  seasonUsed?: number;
+  error?: string;
+  teams: TeamBoard[];
+};
 
-  return json.response ?? [];
+type GetBoardArgs = {
+  leagues: { leagueId: number; leagueName: string }[];
+};
+
+type Ok<T> = { ok: true; data: T };
+type Err = { ok: false; error: string };
+
+const SOFA_BASE = "https://api.sofascore.com/api/v1";
+const IMG_TEAM = "https://img.sofascore.com/api/v1/team";
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function getLast7FinishedFixtures(leagueId: number, teamId: number): Promise<{ seasonUsed: number; fixtures: ApiFixture[] }> {
-  const startSeason = currentSeasonGuess();
-  const collected: ApiFixture[] = [];
-  const seen = new Set<number>();
+async function fetchJson<T>(
+  url: string,
+  opts?: {
+    revalidateSeconds?: number;
+    tries?: number;
+    delayMs?: number;
+  }
+): Promise<T> {
+  const tries = opts?.tries ?? 3;
+  const delayMs = opts?.delayMs ?? 400;
 
-  // Walk back up to 6 seasons if needed (covers weird cases)
-  for (let s = startSeason; s >= startSeason - 6; s--) {
-    let batch: ApiFixture[] = [];
+  let lastErr: any = null;
+
+  for (let i = 0; i < tries; i++) {
     try {
-      batch = await fetchFinishedFixturesForTeamSeason({ leagueId, season: s, teamId });
-    } catch {
-      // ignore season errors; keep going backwards
-      batch = [];
-    }
+      const res = await fetch(url, {
+        // cache rules:
+        // - dynamic league/team lists: no-store
+        // - per-event stats/incidents: revalidate ~24h
+        cache: opts?.revalidateSeconds ? "force-cache" : "no-store",
+        next: opts?.revalidateSeconds ? { revalidate: opts.revalidateSeconds } : undefined,
+        headers: {
+          "user-agent": "Mozilla/5.0",
+          accept: "application/json,text/plain,*/*",
+        },
+      });
 
-    // newest first
-    batch.sort((a, b) => new Date(b.fixture.date).getTime() - new Date(a.fixture.date).getTime());
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} ${res.statusText} @ ${url} :: ${t.slice(0, 200)}`);
+      }
 
-    for (const f of batch) {
-      const id = f.fixture.id;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      collected.push(f);
-      if (collected.length >= 7) break;
-    }
-
-    if (collected.length >= 7) {
-      return { seasonUsed: s, fixtures: collected.slice(0, 7) };
+      return (await res.json()) as T;
+    } catch (e) {
+      lastErr = e;
+      await sleep(delayMs * (i + 1));
     }
   }
 
-  // If we never reached 7, return whatever we found
-  return { seasonUsed: startSeason, fixtures: collected.slice(0, 7) };
+  throw lastErr ?? new Error("fetch failed");
 }
 
-// ---- teams in league ----
-async function fetchTeamsInLeague(leagueId: number, season: number): Promise<ApiTeam[]> {
-  const json = await apiFetchJson<ApiResponse<ApiTeam[]>>(`/teams?league=${leagueId}&season=${season}`, {
-    cacheMode: "no-store",
-    retries: 3,
+/**
+ * Get "latest" seasonId for a tournament.
+ * Unofficial API shape, but generally returns { seasons: [...] } with "year"/"id".
+ */
+async function getLatestSeasonId(uniqueTournamentId: number): Promise<{ seasonId: number; seasonName?: string }> {
+  const j = await fetchJson<any>(`${SOFA_BASE}/unique-tournament/${uniqueTournamentId}/seasons`, {
+    tries: 3,
+    delayMs: 350,
   });
-  return json.response ?? [];
+
+  const seasons: any[] = Array.isArray(j?.seasons) ? j.seasons : [];
+  if (!seasons.length) throw new Error(`No seasons for tournament ${uniqueTournamentId}`);
+
+  // pick the greatest "year" if present, else last element
+  const sorted = [...seasons].sort((a, b) => (b?.year ?? 0) - (a?.year ?? 0));
+  const pick = sorted[0] ?? seasons[seasons.length - 1];
+
+  if (!pick?.id) throw new Error(`Bad seasons payload for tournament ${uniqueTournamentId}`);
+
+  return { seasonId: Number(pick.id), seasonName: pick?.name };
 }
 
-// ---- public: build league blocks (your page.tsx calls this) ----
-export async function getLeagueBoard(args: {
-  leagues: Array<{ leagueId: number; leagueName: string; season?: number }>;
-}): Promise<LeagueBoard> {
+/**
+ * League standings -> list of teams (id + name)
+ */
+async function getTeamsFromStandings(uniqueTournamentId: number, seasonId: number): Promise<Array<{ id: number; name: string }>> {
+  // common endpoint pattern used by sofascore internal API
+  const j = await fetchJson<any>(`${SOFA_BASE}/unique-tournament/${uniqueTournamentId}/season/${seasonId}/standings/total`, {
+    tries: 3,
+    delayMs: 350,
+  });
+
+  // shape usually: { standings: [ { rows: [ { team: { id, name } } ] } ] }
+  const standings = Array.isArray(j?.standings) ? j.standings : [];
+  const rows = Array.isArray(standings?.[0]?.rows) ? standings[0].rows : [];
+
+  const teams = rows
+    .map((r: any) => r?.team)
+    .filter(Boolean)
+    .map((t: any) => ({ id: Number(t.id), name: String(t.name ?? "Unknown") }))
+    .filter((t: any) => Number.isFinite(t.id));
+
+  // de-dupe
+  const seen = new Set<number>();
+  return teams.filter((t) => (seen.has(t.id) ? false : (seen.add(t.id), true)));
+}
+
+/**
+ * Team events -> last finished events; returns event ids
+ * Endpoint noted in public writeups: /api/v1/team/{team_id}/events/last/{page} :contentReference[oaicite:7]{index=7}
+ */
+async function getLastFinishedEvents(teamId: number, need: number): Promise<any[]> {
+  const out: any[] = [];
+  for (let page = 0; page < 5 && out.length < need; page++) {
+    const j = await fetchJson<any>(`${SOFA_BASE}/team/${teamId}/events/last/${page}`, { tries: 3, delayMs: 350 });
+    const events: any[] = Array.isArray(j?.events) ? j.events : [];
+
+    for (const ev of events) {
+      const status = ev?.status?.type || ev?.status;
+      // typical: "finished" / "inprogress" / "notstarted"
+      if (String(status).toLowerCase() === "finished") out.push(ev);
+      if (out.length >= need) break;
+    }
+  }
+  return out.slice(0, need);
+}
+
+/**
+ * Event stats: corners
+ * We look for a stat item named "Corner kicks" (or similar) and sum home+away.
+ * Stats are cached 24h because they don't change after FT.
+ */
+async function getCornersTotal(eventId: number): Promise<number> {
   try {
-    const blocks: LeagueBlock[] = [];
+    const j = await fetchJson<any>(`${SOFA_BASE}/event/${eventId}/statistics`, {
+      revalidateSeconds: 60 * 60 * 24,
+      tries: 3,
+      delayMs: 350,
+    });
+
+    // Typical structure: { statistics: [ { period: "ALL", groups: [ { groupName, statisticsItems: [...] } ] } ] }
+    const blocks: any[] = Array.isArray(j?.statistics) ? j.statistics : [];
+    const all = blocks.find((b) => String(b?.period).toUpperCase() === "ALL") ?? blocks[0];
+    const groups: any[] = Array.isArray(all?.groups) ? all.groups : [];
+
+    const items = groups.flatMap((g) => (Array.isArray(g?.statisticsItems) ? g.statisticsItems : []));
+    const cornerItem =
+      items.find((it: any) => String(it?.name).toLowerCase() === "corner kicks") ??
+      items.find((it: any) => String(it?.name).toLowerCase().includes("corner"));
+
+    const home = Number(cornerItem?.home ?? cornerItem?.homeValue ?? 0) || 0;
+    const away = Number(cornerItem?.away ?? cornerItem?.awayValue ?? 0) || 0;
+
+    return home + away;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Event incidents: cards
+ * Incidents cached 24h after FT.
+ */
+async function getCardsTotal(eventId: number): Promise<number> {
+  try {
+    const j = await fetchJson<any>(`${SOFA_BASE}/event/${eventId}/incidents`, {
+      revalidateSeconds: 60 * 60 * 24,
+      tries: 3,
+      delayMs: 350,
+    });
+
+    const inc: any[] = Array.isArray(j?.incidents) ? j.incidents : [];
+
+    // Count both yellow + red. (Google shows them separately; you want total.)
+    // incidentType values vary; we check for "yellow"/"red" in the string.
+    let total = 0;
+    for (const x of inc) {
+      const t = String(x?.incidentType ?? x?.type ?? "").toLowerCase();
+      if (t.includes("yellow") || t.includes("red")) total += 1;
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
+function buildTeamLogo(teamId: number) {
+  // stable image endpoint used by sofascore
+  return `${IMG_TEAM}/${teamId}/image`;
+}
+
+function safeDateISO(ev: any): string {
+  // sofascore usually provides startTimestamp (seconds)
+  const ts = Number(ev?.startTimestamp);
+  if (Number.isFinite(ts) && ts > 0) return new Date(ts * 1000).toISOString();
+  // fallback if they provide startDate
+  if (ev?.startDate) return new Date(ev.startDate).toISOString();
+  return new Date().toISOString();
+}
+
+function getGoalsTotalFromEvent(ev: any): number {
+  const home = Number(ev?.homeScore?.current ?? 0) || 0;
+  const away = Number(ev?.awayScore?.current ?? 0) || 0;
+  return home + away;
+}
+
+function opponentName(ev: any, teamId: number): { name: string; isHome: boolean } {
+  const homeId = Number(ev?.homeTeam?.id);
+  const awayId = Number(ev?.awayTeam?.id);
+
+  const isHome = homeId === teamId;
+  const opp = isHome ? ev?.awayTeam?.name : ev?.homeTeam?.name;
+
+  return { name: String(opp ?? "-"), isHome };
+}
+
+/**
+ * MAIN exported function used by your route.ts
+ */
+export async function getLeagueBoard(args: GetBoardArgs): Promise<Ok<LeagueBoard[]> | Err> {
+  try {
+    const leagues: LeagueBoard[] = [];
 
     for (const L of args.leagues) {
-      const season = L.season ?? currentSeasonGuess();
-      const teamsResp = await fetchTeamsInLeague(L.leagueId, season);
+      try {
+        const { seasonId } = await getLatestSeasonId(L.leagueId);
+        const teams = await getTeamsFromStandings(L.leagueId, seasonId);
 
-      const teams: TeamBlock[] = [];
+        const teamBoards: TeamBoard[] = [];
 
-      for (const t of teamsResp) {
-        const teamId = t.team.id;
-        const name = t.team.name;
-        const logo = t.team.logo;
+        for (const t of teams) {
+          const events = await getLastFinishedEvents(t.id, 7);
 
-        const { seasonUsed, fixtures } = await getLast7FinishedFixtures(L.leagueId, teamId);
+          const matches: MatchCard[] = [];
+          for (const ev of events) {
+            const eventId = Number(ev?.id);
+            const { name: opp, isHome } = opponentName(ev, t.id);
 
-        const matches: MatchRow[] = await Promise.all(
-          fixtures.map(async (fx) => {
-            const fixtureId = fx.fixture.id;
-            const date = fx.fixture.date;
+            const goalsTotal = getGoalsTotalFromEvent(ev);
+            const cornersTotal = await getCornersTotal(eventId);
+            const cardsTotal = await getCardsTotal(eventId);
 
-            const homeId = fx.teams.home.id;
-            const awayId = fx.teams.away.id;
-
-            const isHome = homeId === teamId;
-            const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
-
-            const goalsHome = fx.goals.home ?? 0;
-            const goalsAway = fx.goals.away ?? 0;
-            const goalsTotal = goalsHome + goalsAway;
-
-            // IMPORTANT: always numbers, never null
-            const cornersTotal = await getCornersTotal(fixtureId);
-            const cardsTotal = await getCardsTotal(fixtureId);
-
-            return {
-              fixtureId,
-              date,
-              opponent,
+            matches.push({
+              fixtureId: eventId,
+              date: safeDateISO(ev),
+              opponent: opp,
               isHome,
               goalsTotal,
               cornersTotal,
               cardsTotal,
-            };
-          })
-        );
+            });
+          }
 
-        teams.push({ teamId, name, logo, matches });
+          // Ensure exactly 7 slots (no blanks that crash UI)
+          while (matches.length < 7) {
+            matches.push({
+              fixtureId: 0,
+              date: "",
+              opponent: "-",
+              isHome: true,
+              goalsTotal: 0,
+              cornersTotal: 0,
+              cardsTotal: 0,
+            });
+          }
 
-        // prefer the earliest season that actually produced matches for this team
-        blocks.push({
+          teamBoards.push({
+            teamId: t.id,
+            name: t.name,
+            logo: buildTeamLogo(t.id),
+            matches: matches.slice(0, 7),
+          });
+        }
+
+        leagues.push({
           leagueId: L.leagueId,
           leagueName: L.leagueName,
-          seasonUsed,
-          teams,
+          seasonUsed: seasonId,
+          teams: teamBoards,
         });
-
-        // NOTE: we pushed block inside loop? -> fix: break out of building block once at end.
-        // We'll undo this below.
-        blocks.pop();
+      } catch (e: any) {
+        leagues.push({
+          leagueId: L.leagueId,
+          leagueName: L.leagueName,
+          error: e?.message ?? String(e),
+          teams: [],
+        });
       }
-
-      // finalize this league block once
-      const seasonUsedFinal = season;
-      blocks.push({
-        leagueId: L.leagueId,
-        leagueName: L.leagueName,
-        seasonUsed: seasonUsedFinal,
-        teams,
-      });
     }
 
-    return { ok: true, data: blocks };
+    return { ok: true, data: leagues };
   } catch (e: any) {
-    return { ok: false, data: [], error: e?.message ?? String(e) };
+    return { ok: false, error: e?.message ?? String(e) };
   }
 }
