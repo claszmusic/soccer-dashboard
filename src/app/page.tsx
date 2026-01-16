@@ -1,138 +1,166 @@
-// src/app/page.tsx
-import { buildLeagueBoard } from "@/lib/leagueData";
-
-export const dynamic = "force-dynamic"; // IMPORTANT: don't prerender + cache empty data
-export const revalidate = 0;
+import { buildLeagueBoard, LeagueBoard } from "@/lib/leagueData";
 
 const LEAGUES = [
-  { leagueName: "Liga MX", country: "Mexico" },
-  { leagueName: "Premier League", country: "England" },
-  { leagueName: "Bundesliga", country: "Germany" },
-  { leagueName: "La Liga", country: "Spain" },
-  { leagueName: "Serie A", country: "Italy" },
+  { title: "Liga MX", country: "Mexico", leagueName: "Liga MX" },
+  { title: "Premier League", country: "England", leagueName: "Premier League" },
+  { title: "Bundesliga", country: "Germany", leagueName: "Bundesliga" },
+  { title: "La Liga", country: "Spain", leagueName: "La Liga" },
+  { title: "Serie A", country: "Italy", leagueName: "Serie A" },
 ];
 
-function badgeClass(kind: "g" | "c" | "ck", val?: number) {
-  if (val === undefined) return "text-slate-400";
-  if (kind === "g") return val >= 3 ? "text-green-600" : "text-red-600";
-  if (kind === "c") return val >= 5 ? "text-green-600" : "text-red-600";
+function statColor(type: "G" | "C" | "CK", value: number) {
+  // Your rules
+  if (type === "G") return value <= 2 ? "text-red-600" : "text-green-600";
+  if (type === "C") return value <= 4 ? "text-red-600" : "text-green-600";
   // corners: greener when higher
-  return val >= 8 ? "text-green-600" : "text-red-600";
+  return value >= 8 ? "text-green-600" : value >= 5 ? "text-green-500" : "text-red-600";
 }
 
-function CellCard(props: { opponent?: string; ck?: number; g?: number; c?: number }) {
-  const { opponent, ck, g, c } = props;
-
+function MatchCard({
+  opponent,
+  homeAway,
+  ck,
+  g,
+  c,
+}: {
+  opponent: string;
+  homeAway: "H" | "A";
+  ck: number;
+  g: number;
+  c: number;
+}) {
   return (
-    <div className="rounded-2xl border border-red-200 bg-red-50/60 px-3 py-2 min-h-[92px] w-[120px]">
-      <div className="text-xs font-semibold text-slate-700 leading-tight min-h-[28px]">
-        {opponent ?? "-"}
+    <div className="rounded-2xl border border-red-200 bg-red-50 p-3 w-[120px]">
+      <div className="text-xs font-semibold text-slate-800 mb-2 leading-tight">
+        {opponent} ({homeAway})
       </div>
 
-      <div className="mt-1 grid grid-cols-[28px_1fr] gap-x-2 text-sm">
-        <div className="text-red-600 font-bold">CK</div>
-        <div className={`text-right font-bold ${badgeClass("ck", ck)}`}>{ck ?? "-"}</div>
+      <div className="flex justify-between text-sm">
+        <span className="font-semibold text-red-600">CK</span>
+        <span className={`font-bold ${statColor("CK", ck)}`}>{ck}</span>
+      </div>
 
-        <div className="text-slate-600 font-bold">G</div>
-        <div className={`text-right font-bold ${badgeClass("g", g)}`}>{g ?? "-"}</div>
+      <div className="flex justify-between text-sm">
+        <span className="font-semibold text-slate-600">G</span>
+        <span className={`font-bold ${statColor("G", g)}`}>{g}</span>
+      </div>
 
-        <div className="text-slate-600 font-bold">C</div>
-        <div className={`text-right font-bold ${badgeClass("c", c)}`}>{c ?? "-"}</div>
+      <div className="flex justify-between text-sm">
+        <span className="font-semibold text-slate-600">C</span>
+        <span className={`font-bold ${statColor("C", c)}`}>{c}</span>
       </div>
     </div>
   );
 }
 
-function LeagueTable({ board }: { board: Awaited<ReturnType<typeof buildLeagueBoard>> }) {
-  if (board.error) {
-    return (
-      <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-        <div className="font-bold">Error from API</div>
-        <div className="mt-1 break-words">{board.error}</div>
-        <div className="mt-2 text-xs text-red-700/80">
-          (This usually means: missing APISPORTS_KEY in Vercel Production, or API returned 401/403/429)
-        </div>
-      </div>
-    );
-  }
-
-  if (!board.rows || board.rows.length === 0) {
-    return (
-      <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-        No rows returned.
-      </div>
-    );
-  }
-
+function EmptyCard() {
   return (
-    <div className="mt-4 overflow-x-auto rounded-2xl border border-slate-200 bg-white">
-      <table className="min-w-[900px] w-full">
-        <thead>
-          <tr className="bg-slate-50 text-left text-sm text-slate-700">
-            <th className="p-4 w-[240px]">Team</th>
-            {Array.from({ length: 7 }).map((_, i) => (
-              <th key={i} className="p-4 text-center">
-                Match {i + 1}
-              </th>
-            ))}
-          </tr>
-        </thead>
-
-        <tbody>
-          {board.rows.map((r) => (
-            <tr key={r.teamId} className="border-t border-slate-100 align-top">
-              <td className="p-4 font-semibold text-slate-900">{r.teamName}</td>
-              {r.cells.map((cell, idx) => (
-                <td key={idx} className="p-4">
-                  <CellCard opponent={cell.opponent} ck={cell.ck} g={cell.g} c={cell.c} />
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="rounded-2xl border border-red-200 bg-red-50 p-3 w-[120px]">
+      <div className="text-xs font-semibold text-slate-800 mb-2">—</div>
+      <div className="flex justify-between text-sm">
+        <span className="font-semibold text-red-600">CK</span>
+        <span className="font-bold text-slate-400">-</span>
+      </div>
+      <div className="flex justify-between text-sm">
+        <span className="font-semibold text-slate-600">G</span>
+        <span className="font-bold text-slate-400">-</span>
+      </div>
+      <div className="flex justify-between text-sm">
+        <span className="font-semibold text-slate-600">C</span>
+        <span className="font-bold text-slate-400">-</span>
+      </div>
     </div>
+  );
+}
+
+function LeagueSection({ title, board }: { title: string; board: LeagueBoard }) {
+  return (
+    <section className="mb-12">
+      <h2 className="text-4xl font-extrabold text-slate-900">{title}</h2>
+      <div className="h-1 w-24 bg-blue-600 rounded mt-2 mb-6" />
+
+      {/* If league returns no teams, show message but DO NOT crash */}
+      {board.rows.length === 0 ? (
+        <div className="rounded-xl border border-slate-200 bg-white p-4 text-slate-600">
+          No data returned for this league right now.
+        </div>
+      ) : (
+        <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
+          {/* header */}
+          <div className="min-w-[980px] grid grid-cols-[220px_repeat(7,140px)] gap-0 border-b border-slate-200 bg-slate-50 p-4 text-sm font-semibold text-slate-700">
+            <div>Team</div>
+            {Array.from({ length: 7 }).map((_, i) => (
+              <div key={i} className="text-center">
+                Match {i + 1}
+              </div>
+            ))}
+          </div>
+
+          {/* rows */}
+          <div className="min-w-[980px]">
+            {board.rows.map((row) => (
+              <div
+                key={row.teamId}
+                className="grid grid-cols-[220px_repeat(7,140px)] p-4 border-b border-slate-100"
+              >
+                <div className="font-bold text-slate-900 flex items-center">
+                  {row.teamName}
+                </div>
+
+                {Array.from({ length: 7 }).map((_, i) => {
+                  const m = row.matches[i];
+                  return (
+                    <div key={i} className="flex justify-center">
+                      {m ? (
+                        <MatchCard
+                          opponent={m.opponent}
+                          homeAway={m.homeAway}
+                          ck={m.ck}
+                          g={m.g}
+                          c={m.c}
+                        />
+                      ) : (
+                        <EmptyCard />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
 export default async function Page() {
-  // Run all leagues safely (do not let one failure blank the whole page)
-  const results = await Promise.all(
+  // IMPORTANT: we fetch on the server; errors handled so UI never disappears
+  const boards = await Promise.all(
     LEAGUES.map(async (l) => {
       try {
-        const board = await buildLeagueBoard({ leagueName: l.leagueName, country: l.country, columns: 7 });
-        return { key: l.leagueName, board };
-      } catch (e: any) {
-        return {
-          key: l.leagueName,
-          board: {
-            leagueTitle: l.leagueName,
-            season: new Date().getFullYear(),
-            rows: [],
-            error: e?.message ?? String(e),
-          },
-        };
+        const board = await buildLeagueBoard({
+          leagueName: l.leagueName,
+          country: l.country,
+        });
+        return { title: l.title, board };
+      } catch {
+        return { title: l.title, board: { leagueTitle: l.title, rows: [] } as LeagueBoard };
       }
     })
   );
 
   return (
-    <main className="mx-auto max-w-6xl px-6 py-10">
+    <main className="max-w-6xl mx-auto px-6 py-10">
       <h1 className="text-3xl font-extrabold text-slate-900">Soccer Dashboard</h1>
-      <div className="mt-2 text-sm text-slate-600">
-        CK = Corner Kicks · G = Goals · C = Cards
-      </div>
-      <div className="mt-1 text-xs text-slate-500">
+      <p className="text-slate-600 mt-1">CK = Corner Kicks · G = Goals · C = Cards</p>
+      <p className="text-slate-500 text-sm mt-1">
         Goals: red ≤ 2, green ≥ 3 · Cards: red ≤ 4, green ≥ 5 · Corners: greener when higher
-      </div>
+      </p>
 
-      <div className="mt-10 space-y-14">
-        {results.map(({ key, board }) => (
-          <section key={key}>
-            <h2 className="text-4xl font-extrabold text-slate-900">{board.leagueTitle}</h2>
-            <div className="mt-2 h-1 w-24 rounded bg-blue-600" />
-            <LeagueTable board={board as any} />
-          </section>
+      <div className="mt-10">
+        {boards.map(({ title, board }) => (
+          <LeagueSection key={title} title={title} board={board} />
         ))}
       </div>
     </main>
