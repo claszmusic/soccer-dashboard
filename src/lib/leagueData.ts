@@ -2,7 +2,8 @@ import { apiFootball } from "./apifootball";
 
 export type MatchCell = {
   fixtureId?: number;
-  dateLabel: string;
+  opponent?: string; // who they played
+  homeAway?: "H" | "A";
   ck?: number;
   g?: number;
   c?: number;
@@ -11,147 +12,131 @@ export type MatchCell = {
 export type LeagueBoard = {
   leagueTitle: string;
   season: number;
-  dateColumns: string[];
+  columns: number; // always 7
   rows: Array<{
     teamId: number;
     teamName: string;
-    cells: MatchCell[];
+    cells: MatchCell[]; // length === columns
   }>;
 };
 
-function monthDayLabel(dateISO: string) {
-  const d = new Date(dateISO);
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+async function resolveLeague(leagueName: string, country: string, season: number) {
+  const trySeason = async (s: number) => {
+    const data = await apiFootball<{
+      response: Array<{ league: { id: number }; country: { name: string } }>;
+    }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
+
+    const id = data.response?.[0]?.league?.id ?? null;
+    return id ? { leagueId: id, seasonUsed: s } : null;
+  };
+
+  return (await trySeason(season)) || (await trySeason(season - 1)) || null;
 }
 
 function getStatValue(stats: Array<{ type: string; value: number | null }>, type: string) {
   return stats.find((s) => s.type === type)?.value ?? null;
 }
 
-async function resolveLeagueId(leagueName: string, country: string, season: number) {
-  const trySeason = async (s: number) => {
-    const data = await apiFootball<{
-      response: Array<{ league: { id: number }; country: { name: string } }>;
-    }>("/leagues", { name: leagueName, country, season: s }, 60 * 60 * 24);
-
-    return data.response?.[0]?.league?.id ?? null;
-  };
-
-  return (await trySeason(season)) || (await trySeason(season - 1));
-}
-
 export async function buildLeagueBoard(opts: {
   leagueName: string;
   country: string;
   season: number;
-  columns?: number;
+  columns?: number; // default 7
 }): Promise<LeagueBoard> {
   const { leagueName, country, season, columns = 7 } = opts;
 
-  const leagueId = await resolveLeagueId(leagueName, country, season);
-  if (!leagueId) throw new Error("League ID not found");
+  const resolved = await resolveLeague(leagueName, country, season);
+  if (!resolved) {
+    // Never crash the whole page
+    return { leagueTitle: leagueName, season, columns, rows: [] };
+  }
 
+  const { leagueId, seasonUsed } = resolved;
+
+  // 1) Get ALL teams
   const teams = await apiFootball<{
     response: Array<{ team: { id: number; name: string } }>;
-  }>("/teams", { league: leagueId, season }, 60 * 60 * 24);
+  }>("/teams", { league: leagueId, season: seasonUsed }, 60 * 60 * 24);
 
   const teamList = teams.response.map((t) => ({ id: t.team.id, name: t.team.name }));
 
-  const leagueFix = await apiFootball<{
-    response: Array<{ fixture: { id: number; date: string } }>;
-  }>("/fixtures", { league: leagueId, season, status: "FT", last: 250 }, 60 * 60 * 6);
-
-  const dateColumns: string[] = [];
-  const seen = new Set<string>();
-
-  for (const fx of leagueFix.response) {
-    const label = monthDayLabel(fx.fixture.date);
-    if (seen.has(label)) continue;
-    seen.add(label);
-    dateColumns.push(label);
-    if (dateColumns.length >= columns) break;
-  }
-
+  // 2) For each team, fetch LAST 7 matches.
+  // Prefer finished (FT) so we get real numbers, but if league has no finished yet, fallback to last matches anyway.
   const rows: LeagueBoard["rows"] = [];
 
   for (const team of teamList) {
-    const fixtures = await apiFootball<{
+    // Try finished matches first
+    let fixtures = await apiFootball<{
       response: Array<{
-        fixture: { id: number; date: string; status: { short: string } };
+        fixture: { id: number; status: { short: string } };
+        teams: {
+          home: { id: number; name: string };
+          away: { id: number; name: string };
+        };
         goals: { home: number | null; away: number | null };
-        teams: { home: { id: number }; away: { id: number } };
       }>;
-    }>("/fixtures", { league: leagueId, season, team: team.id, last: 40 }, 60 * 60 * 6);
+    }>("/fixtures", { league: leagueId, season: seasonUsed, team: team.id, status: "FT", last: columns }, 60 * 60 * 6);
 
-    const byDate: Record<
-      string,
-      { fixtureId: number; dateLabel: string; goalsFor: number; finished: boolean }
-    > = {};
-
-    for (const fx of fixtures.response) {
-      const dateLabel = monthDayLabel(fx.fixture.date);
-      if (!dateColumns.includes(dateLabel)) continue;
-
-      const isHome = fx.teams.home.id === team.id;
-      const goalsFor = isHome ? (fx.goals.home ?? 0) : (fx.goals.away ?? 0);
-      const finished = fx.fixture.status.short === "FT";
-
-      byDate[dateLabel] = {
-        fixtureId: fx.fixture.id,
-        dateLabel,
-        goalsFor,
-        finished,
-      };
+    // If not enough finished games, fallback to whatever exists
+    if (!fixtures.response || fixtures.response.length < columns) {
+      fixtures = await apiFootball<{
+        response: Array<{
+          fixture: { id: number; status: { short: string } };
+          teams: {
+            home: { id: number; name: string };
+            away: { id: number; name: string };
+          };
+          goals: { home: number | null; away: number | null };
+        }>;
+      }>("/fixtures", { league: leagueId, season: seasonUsed, team: team.id, last: columns }, 60 * 60 * 6);
     }
 
     const cells: MatchCell[] = [];
 
-    for (const d of dateColumns) {
-      const fx = byDate[d];
-      if (!fx) {
-        cells.push({ dateLabel: d });
-        continue;
+    for (const fx of fixtures.response.slice(0, columns)) {
+      const isHome = fx.teams.home.id === team.id;
+      const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
+      const goalsFor = isHome ? (fx.goals.home ?? 0) : (fx.goals.away ?? 0);
+
+      const status = fx.fixture.status.short;
+      const isFinished = status === "FT" || status === "AET" || status === "PEN";
+
+      // default
+      const cell: MatchCell = {
+        fixtureId: fx.fixture.id,
+        opponent,
+        homeAway: isHome ? "H" : "A",
+        g: goalsFor,
+      };
+
+      // Corners/Cards only if finished (stats usually not ready before FT)
+      if (isFinished) {
+        try {
+          const stats = await apiFootball<{
+            response: Array<{
+              team: { id: number };
+              statistics: Array<{ type: string; value: number | null }>;
+            }>;
+          }>("/fixtures/statistics", { fixture: fx.fixture.id }, 60 * 60 * 24);
+
+          const teamStats = stats.response.find((s) => s.team.id === team.id)?.statistics ?? [];
+
+          const corners = getStatValue(teamStats, "Corner Kicks");
+          const yellows = getStatValue(teamStats, "Yellow Cards") ?? 0;
+          const reds = getStatValue(teamStats, "Red Cards") ?? 0;
+
+          cell.ck = typeof corners === "number" ? corners : undefined;
+          cell.c = yellows + reds;
+        } catch {
+          // leave ck/c undefined if stats missing
+        }
       }
 
-      if (!fx.finished) {
-        cells.push({
-          fixtureId: fx.fixtureId,
-          dateLabel: d,
-          g: fx.goalsFor,
-        });
-        continue;
-      }
-
-      let ck: number | undefined = undefined;
-      let c: number | undefined = undefined;
-
-      try {
-        const stats = await apiFootball<{
-          response: Array<{
-            team: { id: number };
-            statistics: Array<{ type: string; value: number | null }>;
-          }>;
-        }>("/fixtures/statistics", { fixture: fx.fixtureId }, 60 * 60 * 24);
-
-        const teamStats =
-          stats.response.find((s) => s.team.id === team.id)?.statistics ?? [];
-
-        const corners = getStatValue(teamStats, "Corner Kicks");
-        const yellows = getStatValue(teamStats, "Yellow Cards") ?? 0;
-        const reds = getStatValue(teamStats, "Red Cards") ?? 0;
-
-        ck = typeof corners === "number" ? corners : undefined;
-        c = yellows + reds;
-      } catch {}
-
-      cells.push({
-        fixtureId: fx.fixtureId,
-        dateLabel: d,
-        ck,
-        g: fx.goalsFor,
-        c,
-      });
+      cells.push(cell);
     }
+
+    // Always ensure exactly 7 cells so the UI never collapses
+    while (cells.length < columns) cells.push({});
 
     rows.push({
       teamId: team.id,
@@ -162,8 +147,8 @@ export async function buildLeagueBoard(opts: {
 
   return {
     leagueTitle: leagueName,
-    season,
-    dateColumns,
+    season: seasonUsed,
+    columns,
     rows,
   };
 }
