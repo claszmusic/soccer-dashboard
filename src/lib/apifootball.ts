@@ -1,4 +1,4 @@
-// src/lib/apiFootball.ts
+// src/lib/apifootball.ts
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: string; status?: number; details?: unknown };
 export type ApiResult<T> = ApiOk<T> | ApiErr;
@@ -30,19 +30,14 @@ export async function apiGet<T>(
       headers: {
         "x-apisports-key": getKey(),
       },
-      // Avoid “sometimes empty” caching on Vercel
       cache: opts.noStore ? "no-store" : "force-cache",
-      // If you want auto refresh, you can also use:
-      // next: { revalidate: 60 },
     });
 
     const status = res.status;
     let json: any = null;
     try {
       json = await res.json();
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     if (!res.ok) {
       const msg =
@@ -54,7 +49,6 @@ export async function apiGet<T>(
       return { ok: false, error: msg, status, details: json };
     }
 
-    // API-Football typically uses: { response: ... , errors: ... }
     if (json?.errors && Object.keys(json.errors).length > 0) {
       return { ok: false, error: `API errors: ${JSON.stringify(json.errors)}`, status, details: json };
     }
