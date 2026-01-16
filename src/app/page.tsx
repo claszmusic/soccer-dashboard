@@ -1,4 +1,31 @@
-import { getLeagueBoards } from "@/lib/leagueData";
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+type MatchCard = {
+  fixtureId: number;
+  date: string;
+  opponent: string;
+  isHome: boolean;
+  goalsTotal: number | null;
+  cornersTotal: number | null;
+  cardsTotal: number | null;
+};
+
+type TeamBoard = {
+  teamId: number;
+  name: string;
+  logo: string;
+  matches: MatchCard[];
+};
+
+type LeagueBoard = {
+  leagueId: number;
+  leagueName: string;
+  seasonUsed?: number;
+  error?: string;
+  teams: TeamBoard[];
+};
 
 function valOrDash(v: number | null | undefined) {
   return v === null || v === undefined ? "-" : String(v);
@@ -19,18 +46,128 @@ function cornersClass(ck: number) {
   return "text-red-600";
 }
 
-export default async function Page() {
-  const leagues = await getLeagueBoards();
+function isBlankMatch(m: MatchCard | null) {
+  return !m || m.fixtureId === 0;
+}
+
+function countBlankTeams(leagues: LeagueBoard[]) {
+  let blanks = 0;
+  for (const l of leagues) {
+    for (const t of l.teams ?? []) {
+      const allBlank = (t.matches ?? []).every((m) => m.fixtureId === 0);
+      if (allBlank) blanks++;
+    }
+  }
+  return blanks;
+}
+
+async function fetchBoardsOnce(): Promise<LeagueBoard[]> {
+  const r = await fetch("/api/leagueBoards", { cache: "no-store" });
+  const j = await r.json();
+  if (!j?.ok) throw new Error(j?.error ?? "Failed to load league boards");
+  return j.leagues as LeagueBoard[];
+}
+
+/**
+ * Try until complete:
+ * - Retries until blankTeams === 0
+ * - Or until maxMs time budget is reached
+ */
+async function fetchBoardsTryUntilComplete(opts?: {
+  maxMs?: number;
+  delayMs?: number;
+  backoff?: boolean;
+}): Promise<{ leagues: LeagueBoard[]; tries: number; complete: boolean }> {
+  const maxMs = opts?.maxMs ?? 25_000;    // up to 25s total
+  const delayMs = opts?.delayMs ?? 900;  // initial delay between tries
+  const backoff = opts?.backoff ?? true;
+
+  const start = Date.now();
+  let tries = 0;
+  let last: LeagueBoard[] = [];
+
+  while (Date.now() - start < maxMs) {
+    tries++;
+    last = await fetchBoardsOnce();
+    const blanks = countBlankTeams(last);
+    if (blanks === 0) return { leagues: last, tries, complete: true };
+
+    const wait = backoff ? Math.min(5000, delayMs * tries) : delayMs;
+    await new Promise((r) => setTimeout(r, wait));
+  }
+
+  return { leagues: last, tries, complete: countBlankTeams(last) === 0 };
+}
+
+export default function Page() {
+  const [leagues, setLeagues] = useState<LeagueBoard[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<string>("");
+
+  const blankTeams = useMemo(() => countBlankTeams(leagues), [leagues]);
+
+  async function refreshTryUntilComplete() {
+    setLoading(true);
+    setStatus("Refreshing… (trying until complete)");
+    try {
+      const res = await fetchBoardsTryUntilComplete({
+        maxMs: 25_000,
+        delayMs: 900,
+        backoff: true,
+      });
+
+      setLeagues(res.leagues);
+
+      const blanks = countBlankTeams(res.leagues);
+      if (blanks === 0) {
+        setStatus(`Complete ✅ (tries: ${res.tries})`);
+      } else {
+        setStatus(`Stopped (time limit). Still blank teams: ${blanks} (tries: ${res.tries})`);
+      }
+    } catch (e: any) {
+      setStatus(`Error: ${e?.message ?? String(e)}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshTryUntilComplete();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <main className="p-6 space-y-12">
       <div className="space-y-2">
-        <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
-        <div className="text-sm text-gray-600">
-          CK = Corner Kicks • G = Goals • C = Cards
-        </div>
-        <div className="text-xs text-gray-500">
-          Goals: red ≤ 2, green ≥ 3 • Cards: red ≤ 4, green ≥ 5 • Corners: greener when higher
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
+            <div className="text-sm text-gray-600">
+              CK = Corner Kicks • G = Goals • C = Cards
+            </div>
+            <div className="text-xs text-gray-500">
+              Goals: red ≤ 2, green ≥ 3 • Cards: red ≤ 4, green ≥ 5 • Corners: greener when higher
+            </div>
+          </div>
+
+          <div className="flex flex-col items-end gap-2">
+            <button
+              onClick={refreshTryUntilComplete}
+              disabled={loading}
+              className={`rounded-lg px-4 py-2 text-sm font-semibold border ${
+                loading
+                  ? "bg-gray-100 text-gray-400 border-gray-200"
+                  : "bg-white hover:bg-gray-50 text-gray-900 border-gray-300"
+              }`}
+            >
+              {loading ? "Trying…" : "Refresh (Try until complete)"}
+            </button>
+
+            <div className="text-xs text-gray-500">
+              {status}
+              {blankTeams > 0 ? ` • Blank teams: ${blankTeams}` : ""}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -71,40 +208,26 @@ export default async function Page() {
                   </tr>
                 ) : (
                   league.teams.map((team) => {
-                    const slots = Array.from({ length: 7 }).map(
-                      (_, i) => team.matches?.[i] ?? null
-                    );
+                    const slots = Array.from({ length: 7 }).map((_, i) => team.matches?.[i] ?? null);
 
                     return (
                       <tr key={team.teamId} className="border-b last:border-0">
-                        {/* Team cell */}
                         <td className="p-4 align-middle">
                           <div className="flex items-center gap-3">
-                            <img
-                              src={team.logo}
-                              alt=""
-                              className="h-7 w-7 rounded"
-                              loading="lazy"
-                            />
-                            <div className="font-semibold text-gray-900">
-                              {team.name}
-                            </div>
+                            <img src={team.logo} alt="" className="h-7 w-7 rounded" loading="lazy" />
+                            <div className="font-semibold text-gray-900">{team.name}</div>
                           </div>
                         </td>
 
-                        {/* Match cards */}
                         {slots.map((m, idx) => {
-                          const isBlank = !m || m.fixtureId === 0;
+                          const blank = isBlankMatch(m);
 
-                          const title = isBlank
-                            ? "-"
-                            : `${m.opponent} (${m.isHome ? "H" : "A"})`;
+                          const title = blank ? "-" : `${m!.opponent} (${m!.isHome ? "H" : "A"})`;
+                          const date = blank ? "" : m!.date.slice(0, 10);
 
-                          const date = isBlank ? "" : m.date.slice(0, 10);
-
-                          const g = isBlank ? null : m.goalsTotal;
-                          const ck = isBlank ? null : m.cornersTotal;
-                          const c = isBlank ? null : m.cardsTotal;
+                          const g = blank ? null : m!.goalsTotal;
+                          const ck = blank ? null : m!.cornersTotal;
+                          const c = blank ? null : m!.cardsTotal;
 
                           return (
                             <td key={idx} className="p-4 align-top">
@@ -113,52 +236,38 @@ export default async function Page() {
                                   <div className="font-semibold text-sm text-gray-900 leading-snug">
                                     {title}
                                   </div>
-                                  <div className="text-xs text-gray-500">
-                                    {date}
-                                  </div>
+                                  <div className="text-xs text-gray-500">{date}</div>
                                 </div>
 
                                 <div className="mt-3 grid grid-cols-2 gap-y-1 text-sm">
-                                  <div className="text-gray-700 font-semibold">
-                                    CK
-                                  </div>
+                                  <div className="text-gray-700 font-semibold">CK</div>
                                   <div
                                     className={
-                                      ck === null
+                                      ck === null || ck === undefined
                                         ? "text-gray-400 text-right"
-                                        : `${cornersClass(
-                                            ck
-                                          )} text-right font-semibold`
+                                        : `${cornersClass(ck)} text-right font-semibold`
                                     }
                                   >
                                     {valOrDash(ck)}
                                   </div>
 
-                                  <div className="text-gray-700 font-semibold">
-                                    G
-                                  </div>
+                                  <div className="text-gray-700 font-semibold">G</div>
                                   <div
                                     className={
-                                      g === null
+                                      g === null || g === undefined
                                         ? "text-gray-400 text-right"
-                                        : `${goalsClass(
-                                            g
-                                          )} text-right font-semibold`
+                                        : `${goalsClass(g)} text-right font-semibold`
                                     }
                                   >
                                     {valOrDash(g)}
                                   </div>
 
-                                  <div className="text-gray-700 font-semibold">
-                                    C
-                                  </div>
+                                  <div className="text-gray-700 font-semibold">C</div>
                                   <div
                                     className={
-                                      c === null
+                                      c === null || c === undefined
                                         ? "text-gray-400 text-right"
-                                        : `${cardsClass(
-                                            c
-                                          )} text-right font-semibold`
+                                        : `${cardsClass(c)} text-right font-semibold`
                                     }
                                   >
                                     {valOrDash(c)}
