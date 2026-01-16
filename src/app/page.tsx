@@ -3,6 +3,7 @@ import { buildLeagueBoard, MatchCell } from "@/lib/leagueData";
 const SEASON = new Date().getFullYear(); // will fallback inside leagueData.ts if needed
 
 
+
 const LEAGUES = [
   { leagueName: "Liga MX", country: "Mexico" },
   { leagueName: "Premier League", country: "England" },
