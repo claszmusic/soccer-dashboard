@@ -11,9 +11,9 @@ export type MatchCard = {
   opponent: string;
   isHome: boolean;
 
-  goalsTotal: number | null;   // home+away goals
+  goalsTotal: number | null; // home+away goals
   cornersTotal: number | null; // home+away corners
-  cardsTotal: number | null;   // home+away (yellow+red)
+  cardsTotal: number | null; // home+away (yellow+red)
 };
 
 export type TeamBoard = {
@@ -84,6 +84,7 @@ function createLimiter(concurrency: number) {
 }
 
 // ---------------- cache (in-memory) ----------------
+// IMPORTANT: do not "poison" cache with long-lived errors.
 type CacheEntry<T> = { value: T; expiresAt: number };
 const cache = new Map<string, CacheEntry<any>>();
 
@@ -121,9 +122,7 @@ async function apiFetch<T>(
     process.env.APISPORTSKEY;
 
   if (!apiKey) {
-    const res = { ok: false as const, error: "Missing APISPORTS_KEY env var" };
-    if (cacheKey) cacheSet(cacheKey, res, ttlMs);
-    return res;
+    return { ok: false as const, error: "Missing APISPORTS_KEY env var" };
   }
 
   const url = `${API_BASE}${path}${toQS(params)}`;
@@ -133,12 +132,11 @@ async function apiFetch<T>(
     try {
       const r = await fetch(url, {
         headers: { "x-apisports-key": apiKey },
-        // Let Next/Vercel cache stable GETs by URL
-        cache: "force-cache",
+        // Use Next revalidate instead of force-cache to avoid stale empty results
+        next: { revalidate: 600 },
       });
 
       if (r.status === 429) {
-        // Backoff: 1s, 2s, 4s, 8s...
         const wait = Math.min(15000, 1000 * Math.pow(2, attempt - 1));
         await sleep(wait);
         continue;
@@ -151,7 +149,8 @@ async function apiFetch<T>(
           error: `API ${r.status}: ${txt || r.statusText}`,
           status: r.status,
         };
-        if (cacheKey) cacheSet(cacheKey, res, ttlMs);
+        // Cache errors only very briefly (prevents "stuck empty board")
+        if (cacheKey) cacheSet(cacheKey, res, 15_000);
         return res;
       }
 
@@ -165,16 +164,14 @@ async function apiFetch<T>(
           ok: false as const,
           error: `Network error: ${e?.message ?? String(e)}`,
         };
-        if (cacheKey) cacheSet(cacheKey, res, ttlMs);
+        if (cacheKey) cacheSet(cacheKey, res, 15_000);
         return res;
       }
       await sleep(Math.min(10000, 600 * Math.pow(2, attempt - 1)));
     }
   }
 
-  const res = { ok: false as const, error: "Unknown error" };
-  if (cacheKey) cacheSet(cacheKey, res, ttlMs);
-  return res;
+  return { ok: false as const, error: "Unknown error" };
 }
 
 // ---------------- API types (minimal) ----------------
@@ -205,7 +202,7 @@ type ApiFixtureStatsResp = {
 
 type ApiEventsResp = {
   response: Array<{
-    type: string;   // "Card", "Goal", etc
+    type: string; // "Card", "Goal", etc
     detail: string; // "Yellow Card", "Red Card", etc
   }>;
 };
@@ -253,18 +250,32 @@ async function getTeamsForLeague(leagueId: number, season: number): Promise<Team
   }));
 }
 
-// Get last 7 FINISHED fixtures for a team.
-// IMPORTANT: We do NOT pass status="FT,AET,PEN" (often inconsistent).
-// Instead: ask for last 25 and filter finished statuses in code.
+// Get last 7 finished fixtures for a team.
+// Primary: status=FT & last=7 (most reliable for "played matches")
+// Fallback: last=30 then filter FINISHED (covers leagues that return odd status mixes)
 async function getLastFinishedFixtures(teamId: number) {
-  const r = await apiFetch<ApiFixturesResp>(
+  // Primary
+  const primary = await apiFetch<ApiFixturesResp>(
     "/fixtures",
-    { team: teamId, last: 25 },
-    { cacheKey: `fixtures:last25:${teamId}`, ttlMs: 10 * 60_000 }
+    { team: teamId, status: "FT", last: 7 },
+    { cacheKey: `fixtures:ft:last7:${teamId}`, ttlMs: 10 * 60_000 }
   );
-  if (!r.ok) return [];
 
-  const all = r.data.response ?? [];
+  if (primary.ok) {
+    const fxs = primary.data.response ?? [];
+    if (fxs.length >= 7) return fxs.slice(0, 7);
+    // if fewer than 7, fall through to fallback
+  }
+
+  // Fallback
+  const fallback = await apiFetch<ApiFixturesResp>(
+    "/fixtures",
+    { team: teamId, last: 30 },
+    { cacheKey: `fixtures:last30:${teamId}`, ttlMs: 10 * 60_000 }
+  );
+  if (!fallback.ok) return [];
+
+  const all = fallback.data.response ?? [];
   const finished = all.filter((fx) => FINISHED.has(fx.fixture.status?.short));
   return finished.slice(0, 7);
 }
@@ -328,11 +339,23 @@ async function retryNullable<T>(
   return null;
 }
 
+function blankMatch(): MatchCard {
+  return {
+    fixtureId: 0,
+    date: "",
+    opponent: "-",
+    isHome: true,
+    goalsTotal: null,
+    cornersTotal: null,
+    cardsTotal: null,
+  };
+}
+
 // ---------------- exported ----------------
 export async function getLeagueBoards(): Promise<LeagueBoard[]> {
   // Throttle to avoid bursts (especially across 5 leagues)
   const teamLimiter = createLimiter(2); // team fixture list calls
-  const fxLimiter = createLimiter(2);   // stats/events calls
+  const fxLimiter = createLimiter(2); // stats/events calls
 
   const out: LeagueBoard[] = [];
 
@@ -348,8 +371,9 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       continue;
     }
 
+    // Teams still require a season in API-Football; use "current season" for team list.
     const teams = await getTeamsForLeague(league.leagueId, season);
-    if (!teams) {
+    if (!teams || teams.length === 0) {
       out.push({
         leagueId: league.leagueId,
         leagueName: league.leagueName,
@@ -364,7 +388,6 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
     const teamFixtures = await Promise.all(
       teams.map((t) =>
         teamLimiter(async () => {
-          // slight spacing reduces burst 429s
           await sleep(120);
           const fixtures = await getLastFinishedFixtures(t.teamId);
           return { team: t, fixtures };
@@ -387,33 +410,23 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
         fxLimiter(async () => {
           await sleep(140);
 
-          const cornersTotal = await retryNullable(
-            () => getCornersTotal(fixtureId),
-            3,
-            600
-          );
-
-          const cardsTotal = await retryNullable(
-            () => getCardsTotal(fixtureId),
-            3,
-            600
-          );
+          const cornersTotal = await retryNullable(() => getCornersTotal(fixtureId), 3, 600);
+          const cardsTotal = await retryNullable(() => getCardsTotal(fixtureId), 3, 600);
 
           fixtureData.set(fixtureId, { cornersTotal, cardsTotal });
         })
       )
     );
 
-    // 4) Map back into TeamBoard matches
+    // 4) Map back into TeamBoard matches (ALWAYS 7 cards)
     const filledTeams: TeamBoard[] = teamFixtures.map(({ team, fixtures }) => {
-      const matches: MatchCard[] = fixtures.map((fx) => {
+      const matchesReal: MatchCard[] = fixtures.map((fx) => {
         const fixtureId = fx.fixture.id;
         const date = fx.fixture.date;
 
         const isHome = team.teamId === fx.teams.home.id;
         const opponent = isHome ? fx.teams.away.name : fx.teams.home.name;
 
-        // Always compute goalsTotal from fixture goals
         const homeGoals = fx.goals.home ?? 0;
         const awayGoals = fx.goals.away ?? 0;
         const goalsTotal = homeGoals + awayGoals;
@@ -431,6 +444,10 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
         };
       });
 
+      // Pad to exactly 7 (prevents UI from looking "broken" for teams with fewer results returned)
+      const matches = matchesReal.slice(0, 7);
+      while (matches.length < 7) matches.push(blankMatch());
+
       return { ...team, matches };
     });
 
@@ -441,7 +458,6 @@ export async function getLeagueBoards(): Promise<LeagueBoard[]> {
       teams: filledTeams,
     });
 
-    // Pause between leagues to avoid spikes across leagues
     await sleep(900);
   }
 
