@@ -5,18 +5,14 @@ function valOrDash(v: number | null | undefined) {
 }
 
 function goalsClass(g: number) {
-  // Goals: red ≤ 2, green ≥ 3
   return g >= 3 ? "text-green-600" : "text-red-600";
 }
 
 function cardsClass(c: number) {
-  // Cards: red ≤ 4, green ≥ 5
   return c >= 5 ? "text-green-600" : "text-red-600";
 }
 
 function cornersClass(ck: number) {
-  // Corners: "greener when higher"
-  // simple tiers:
   if (ck >= 12) return "text-green-700";
   if (ck >= 9) return "text-green-600";
   if (ck >= 6) return "text-green-500";
@@ -75,7 +71,9 @@ export default async function Page() {
                   </tr>
                 ) : (
                   league.teams.map((team) => {
-                    const slots = Array.from({ length: 7 }).map((_, i) => team.matches?.[i] ?? null);
+                    const slots = Array.from({ length: 7 }).map(
+                      (_, i) => team.matches?.[i] ?? null
+                    );
 
                     return (
                       <tr key={team.teamId} className="border-b last:border-0">
@@ -88,18 +86,25 @@ export default async function Page() {
                               className="h-7 w-7 rounded"
                               loading="lazy"
                             />
-                            <div className="font-semibold text-gray-900">{team.name}</div>
+                            <div className="font-semibold text-gray-900">
+                              {team.name}
+                            </div>
                           </div>
                         </td>
 
                         {/* Match cards */}
                         {slots.map((m, idx) => {
-                          const title = m ? `${m.opponent} (${m.isHome ? "H" : "A"})` : "-";
-                          const date = m ? m.date.slice(0, 10) : "";
+                          const isBlank = !m || m.fixtureId === 0;
 
-                          const g = m ? m.goalsTotal : null;
-                          const ck = m ? m.cornersTotal : null;
-                          const c = m ? m.cardsTotal : null;
+                          const title = isBlank
+                            ? "-"
+                            : `${m.opponent} (${m.isHome ? "H" : "A"})`;
+
+                          const date = isBlank ? "" : m.date.slice(0, 10);
+
+                          const g = isBlank ? null : m.goalsTotal;
+                          const ck = isBlank ? null : m.cornersTotal;
+                          const c = isBlank ? null : m.cardsTotal;
 
                           return (
                             <td key={idx} className="p-4 align-top">
@@ -108,38 +113,52 @@ export default async function Page() {
                                   <div className="font-semibold text-sm text-gray-900 leading-snug">
                                     {title}
                                   </div>
-                                  <div className="text-xs text-gray-500">{date}</div>
+                                  <div className="text-xs text-gray-500">
+                                    {date}
+                                  </div>
                                 </div>
 
                                 <div className="mt-3 grid grid-cols-2 gap-y-1 text-sm">
-                                  <div className="text-gray-700 font-semibold">CK</div>
+                                  <div className="text-gray-700 font-semibold">
+                                    CK
+                                  </div>
                                   <div
                                     className={
-                                      ck === null || ck === undefined
+                                      ck === null
                                         ? "text-gray-400 text-right"
-                                        : `${cornersClass(ck)} text-right font-semibold`
+                                        : `${cornersClass(
+                                            ck
+                                          )} text-right font-semibold`
                                     }
                                   >
                                     {valOrDash(ck)}
                                   </div>
 
-                                  <div className="text-gray-700 font-semibold">G</div>
+                                  <div className="text-gray-700 font-semibold">
+                                    G
+                                  </div>
                                   <div
                                     className={
-                                      g === null || g === undefined
+                                      g === null
                                         ? "text-gray-400 text-right"
-                                        : `${goalsClass(g)} text-right font-semibold`
+                                        : `${goalsClass(
+                                            g
+                                          )} text-right font-semibold`
                                     }
                                   >
                                     {valOrDash(g)}
                                   </div>
 
-                                  <div className="text-gray-700 font-semibold">C</div>
+                                  <div className="text-gray-700 font-semibold">
+                                    C
+                                  </div>
                                   <div
                                     className={
-                                      c === null || c === undefined
+                                      c === null
                                         ? "text-gray-400 text-right"
-                                        : `${cardsClass(c)} text-right font-semibold`
+                                        : `${cardsClass(
+                                            c
+                                          )} text-right font-semibold`
                                     }
                                   >
                                     {valOrDash(c)}
