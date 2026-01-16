@@ -1,93 +1,36 @@
-import { buildLeagueBoard } from "@/lib/leagueData";
+import { buildLeagueBoard } from "../lib/leagueData";
 
-function statClass(value: number | undefined, kind: "ck" | "g" | "c") {
-  if (value === undefined) return "text-slate-400";
+function numOrDash(v?: number) {
+  return typeof v === "number" ? v : "-";
+}
 
-  if (kind === "g") return value <= 2 ? "text-red-600" : "text-green-600";
-  if (kind === "c") return value <= 4 ? "text-red-600" : "text-green-600";
+// Goals: red ≤ 2, green ≥ 3
+function goalClass(g?: number) {
+  if (typeof g !== "number") return "text-slate-400";
+  return g >= 3 ? "text-green-600" : "text-red-600";
+}
 
-  // CK: greener when higher
-  if (value >= 10) return "text-green-700";
-  if (value >= 8) return "text-green-600";
-  if (value >= 6) return "text-green-500";
+// Cards: red ≤ 4, green ≥ 5
+function cardsClass(c?: number) {
+  if (typeof c !== "number") return "text-slate-400";
+  return c >= 5 ? "text-green-600" : "text-red-600";
+}
+
+// Corners: greener when higher (simple steps)
+function cornersClass(ck?: number) {
+  if (typeof ck !== "number") return "text-slate-400";
+  if (ck >= 10) return "text-green-700";
+  if (ck >= 7) return "text-green-600";
+  if (ck >= 5) return "text-green-500";
   return "text-red-600";
 }
 
-function Card({ cell }: { cell: any }) {
-  return (
-    <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm w-[92px]">
-      <div className="mb-1 text-[11px] font-semibold text-slate-700 leading-tight">
-        {cell?.opponent ? (
-          <>
-            {cell.opponent}
-            {cell.homeAway ? <span className="text-slate-500"> ({cell.homeAway})</span> : null}
-          </>
-        ) : (
-          <span className="text-slate-400">—</span>
-        )}
-      </div>
-
-      <div className="flex items-center justify-between">
-        <span className="font-semibold text-red-600">CK</span>
-        <span className={statClass(cell?.ck, "ck")}>{cell?.ck ?? "-"}</span>
-      </div>
-      <div className="flex items-center justify-between">
-        <span className="font-semibold text-slate-600">G</span>
-        <span className={statClass(cell?.g, "g")}>{cell?.g ?? "-"}</span>
-      </div>
-      <div className="flex items-center justify-between">
-        <span className="font-semibold text-slate-600">C</span>
-        <span className={statClass(cell?.c, "c")}>{cell?.c ?? "-"}</span>
-      </div>
-    </div>
-  );
-}
-
-function LeagueTable({ board }: { board: Awaited<ReturnType<typeof buildLeagueBoard>> }) {
-  const cols = Array.from({ length: board.columns }, (_, i) => i + 1);
-
-  return (
-    <section className="mb-10">
-      <h2 className="text-3xl font-extrabold tracking-tight">{board.leagueTitle}</h2>
-      <div className="mt-2 h-1 w-24 bg-blue-600 rounded" />
-
-      <div className="mt-4 overflow-x-auto rounded-xl border bg-white">
-        <table className="min-w-[980px] w-full">
-          <thead>
-            <tr className="text-left text-slate-600 text-sm">
-              <th className="px-6 py-4 w-[240px]">Team</th>
-              {cols.map((n) => (
-                <th key={n} className="px-3 py-4 text-center">
-                  {n}
-                </th>
-              ))}
-            </tr>
-          </thead>
-
-          <tbody>
-            {board.rows.map((r) => (
-              <tr key={r.teamId} className="border-t">
-                <td className="px-6 py-6 font-semibold text-slate-900">{r.teamName}</td>
-                {r.cells.map((cell: any, idx: number) => (
-                  <td key={idx} className="px-3 py-4 align-top">
-                    <Card cell={cell} />
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="mt-2 text-xs text-slate-500">
-        Columns = last {board.columns} matches per team. (H)=Home, (A)=Away. CK/C usually appear after FT.
-      </div>
-    </section>
-  );
+function cardBgClass() {
+  return "bg-rose-50 border-rose-200";
 }
 
 export default async function Page() {
-  const season = 2026;
+  const season = 2026; // your target season (leagueData.ts will fallback to previous if needed)
 
   const leagues = [
     { leagueName: "Liga MX", country: "Mexico" },
@@ -98,21 +41,97 @@ export default async function Page() {
   ];
 
   const boards = await Promise.all(
-    leagues.map((l) => buildLeagueBoard({ ...l, season, columns: 7 }))
+    leagues.map((l) =>
+      buildLeagueBoard({
+        leagueName: l.leagueName,
+        country: l.country,
+        season,
+        columns: 7, // last 7 FT matches
+      })
+    )
   );
 
   return (
-    <main className="mx-auto max-w-6xl px-6 py-10">
-      <h1 className="text-4xl font-extrabold tracking-tight">Soccer Dashboard</h1>
-      <p className="mt-1 text-slate-600">CK = Corner Kicks · G = Goals · C = Cards</p>
-      <p className="text-xs text-slate-500 mt-1">
-        Goals: red ≤ 2, green ≥ 3 · Cards: red ≤ 4, green ≥ 5 · Corner kicks: greener when higher
-      </p>
+    <main className="min-h-screen bg-white">
+      <div className="mx-auto max-w-6xl px-6 py-8">
+        <h1 className="text-2xl font-bold text-slate-900">Soccer Dashboard</h1>
+        <p className="mt-1 text-sm text-slate-600">
+          CK = Corner Kicks · G = Goals · C = Cards
+        </p>
+        <p className="mt-1 text-xs text-slate-500">
+          Goals: red ≤ 2, green ≥ 3 · Cards: red ≤ 4, green ≥ 5 · Corners: greener when higher
+        </p>
 
-      <div className="mt-10 space-y-10">
-        {boards.map((b) => (
-          <LeagueTable key={b.leagueTitle} board={b} />
-        ))}
+        <div className="mt-8 space-y-12">
+          {boards.map((board) => (
+            <section key={board.leagueTitle}>
+              <h2 className="text-3xl font-extrabold text-slate-900">{board.leagueTitle}</h2>
+              <div className="mt-2 h-1 w-24 rounded bg-blue-600" />
+
+              <div className="mt-6 overflow-x-auto rounded-xl border border-slate-200">
+                <div className="min-w-[980px]">
+                  {/* Header row */}
+                  <div className="grid grid-cols-[220px_repeat(7,1fr)] gap-0 border-b border-slate-200 bg-slate-50 px-4 py-3">
+                    <div className="text-sm font-semibold text-slate-700">Team</div>
+                    {Array.from({ length: 7 }).map((_, i) => (
+                      <div key={i} className="text-center text-xs font-semibold text-slate-600">
+                        Match {i + 1}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Rows */}
+                  {board.rows.map((row) => (
+                    <div
+                      key={row.teamId}
+                      className="grid grid-cols-[220px_repeat(7,1fr)] gap-0 border-b border-slate-100 px-4 py-4"
+                    >
+                      <div className="flex items-center pr-4 text-sm font-semibold text-slate-900">
+                        {row.teamName}
+                      </div>
+
+                      {row.cells.map((cell, idx) => {
+                        const topLabel =
+                          cell.opponent && cell.homeAway
+                            ? `${cell.opponent} (${cell.homeAway})`
+                            : "-";
+
+                        return (
+                          <div key={idx} className="flex items-center justify-center">
+                            <div
+                              className={`w-[110px] rounded-2xl border p-3 text-xs ${cardBgClass()}`}
+                            >
+                              <div className="mb-2 text-[11px] font-semibold text-slate-800">
+                                {topLabel}
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-x-2 gap-y-1">
+                                <div className="font-semibold text-rose-700">CK</div>
+                                <div className={`text-right font-semibold ${cornersClass(cell.ck)}`}>
+                                  {numOrDash(cell.ck)}
+                                </div>
+
+                                <div className="font-semibold text-slate-600">G</div>
+                                <div className={`text-right font-semibold ${goalClass(cell.g)}`}>
+                                  {numOrDash(cell.g)}
+                                </div>
+
+                                <div className="font-semibold text-slate-600">C</div>
+                                <div className={`text-right font-semibold ${cardsClass(cell.c)}`}>
+                                  {numOrDash(cell.c)}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
+          ))}
+        </div>
       </div>
     </main>
   );
