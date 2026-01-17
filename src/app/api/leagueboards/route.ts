@@ -1,26 +1,47 @@
-import { NextResponse } from "next/server";
-import { getLeagueBoard } from "@/lib/leagueData";
+// src/app/api/leagueboards/route.ts
 
-export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+type BlobPayload = {
+  updatedAt?: string;
+  boards?: any[];
+};
 
 export async function GET() {
-  try {
-    const leagues = [
-      { leagueId: 352, leagueName: "Liga MX" },        // sofascore.com/.../liga-mx/352 :contentReference[oaicite:8]{index=8}
-      { leagueId: 17, leagueName: "Premier League" },  // .../premier-league/17 :contentReference[oaicite:9]{index=9}
-      { leagueId: 8, leagueName: "La Liga" },          // .../laliga/8 :contentReference[oaicite:10]{index=10}
-      { leagueId: 35, leagueName: "Bundesliga" },      // .../bundesliga/35 :contentReference[oaicite:11]{index=11}
-      { leagueId: 23, leagueName: "Serie A" },         // .../serie-a/23 :contentReference[oaicite:12]{index=12}
-    ];
+  const url = process.env.BOARDS_JSON_URL;
 
-    const board = await getLeagueBoard({ leagues });
-
-    if (!board.ok) {
-      return NextResponse.json({ ok: false, error: board.error ?? "Unknown error" }, { status: 500 });
-    }
-
-    return NextResponse.json({ ok: true, leagues: board.data });
-  } catch (err: any) {
-    return NextResponse.json({ ok: false, error: err?.message ?? String(err) }, { status: 500 });
+  if (!url) {
+    return Response.json(
+      {
+        ok: false,
+        error:
+          "Missing BOARDS_JSON_URL env var. Set it to your Blob boards.json URL (the blobUrl returned by /api/cron/refresh).",
+      },
+      { status: 500 }
+    );
   }
+
+  const res = await fetch(url, {
+    // Always pull the latest snapshot from Blob
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    return Response.json(
+      {
+        ok: false,
+        error: `Failed to fetch boards.json (${res.status}). ${txt.slice(0, 200)}`,
+      },
+      { status: 502 }
+    );
+  }
+
+  const payload = (await res.json()) as BlobPayload;
+
+  return Response.json({
+    ok: true,
+    updatedAt: payload.updatedAt ?? null,
+    leagues: payload.boards ?? [],
+  });
 }
