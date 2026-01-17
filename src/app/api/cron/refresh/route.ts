@@ -1,6 +1,6 @@
 // src/app/api/cron/refresh/route.ts
 import { put } from "@vercel/blob";
-import { buildAllBoards } from "@/lib/buildBoards";
+import { buildAllBoards } from "../../../../lib/buildBoards";
 
 export const runtime = "nodejs";
 
