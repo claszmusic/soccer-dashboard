@@ -1,60 +1,64 @@
 // src/lib/apifootball.ts
-export type ApiOk<T> = { ok: true; data: T };
-export type ApiErr = { ok: false; error: string; status?: number; details?: unknown };
-export type ApiResult<T> = ApiOk<T> | ApiErr;
+type ApiFootballEnvelope<T> = {
+  get?: string;
+  parameters?: any;
+  errors?: any;
+  results?: number;
+  paging?: any;
+  response: T;
+};
 
-const BASE_URL = "https://v3.football.api-sports.io";
+const API_BASE = "https://v3.football.api-sports.io";
 
-function getKey(): string {
-  const key = process.env.APISPORTS_KEY || process.env.API_FOOTBALL_KEY;
-  if (!key) throw new Error("Missing env var: APISPORTS_KEY (or API_FOOTBALL_KEY)");
-  return key;
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-export async function apiGet<T>(
+export async function apiFootball<TResponse>(
   path: string,
-  params: Record<string, string | number | boolean | undefined> = {},
-  opts: { noStore?: boolean } = {}
-): Promise<ApiResult<T>> {
-  let url = `${BASE_URL}${path}`;
-  const qs = new URLSearchParams();
+  params: Record<string, string | number | boolean | undefined>
+): Promise<TResponse> {
+  const key = process.env.APISPORTS_KEY;
+  if (!key) throw new Error("Missing APISPORTS_KEY");
+
+  const url = new URL(API_BASE + path);
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined) continue;
-    qs.set(k, String(v));
+    url.searchParams.set(k, String(v));
   }
-  if ([...qs.keys()].length) url += `?${qs.toString()}`;
 
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "x-apisports-key": getKey(),
-      },
-      cache: opts.noStore ? "no-store" : "force-cache",
-    });
+  // Basic retry for 429 / transient errors
+  let lastErr: any = null;
 
-    const status = res.status;
-    let json: any = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      json = await res.json();
-    } catch {}
+      const res = await fetch(url.toString(), {
+        headers: {
+          "x-apisports-key": key,
+        },
+        cache: "no-store",
+      });
 
-    if (!res.ok) {
-      const msg =
-        json?.errors
-          ? `API error: ${JSON.stringify(json.errors)}`
-          : json?.message
-            ? `API message: ${json.message}`
-            : `HTTP ${status}`;
-      return { ok: false, error: msg, status, details: json };
+      if (res.status === 429) {
+        // Backoff
+        await sleep(800 * attempt);
+        continue;
+      }
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`API-Football ${res.status}: ${txt.slice(0, 200)}`);
+      }
+
+      const json = (await res.json()) as ApiFootballEnvelope<TResponse>;
+
+      // API-Football always returns { response: [...] }
+      return json.response;
+    } catch (e: any) {
+      lastErr = e;
+      await sleep(300 * attempt);
     }
-
-    if (json?.errors && Object.keys(json.errors).length > 0) {
-      return { ok: false, error: `API errors: ${JSON.stringify(json.errors)}`, status, details: json };
-    }
-
-    return { ok: true, data: json as T };
-  } catch (e: any) {
-    return { ok: false, error: e?.message ?? "Network error", details: e };
   }
+
+  throw lastErr ?? new Error("API-Football request failed");
 }
