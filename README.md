@@ -3,7 +3,7 @@
 This project displays a dashboard for:
 - Bundesliga
 - Premier League
-- Serie A  
+- Serie A   
 - Liga MX  
 - La Liga
 
