@@ -7,9 +7,9 @@ type MatchCard = {
   date: string;
   opponent: string;
   isHome: boolean;
-  goalsTotal: number;   // always a number
-  cornersTotal: number; // always a number
-  cardsTotal: number;   // always a number
+  goalsTotal: number | null;
+  cornersTotal: number | null;
+  cardsTotal: number | null;
 };
 
 type TeamBoard = {
@@ -47,7 +47,6 @@ function cornersClass(ck: number) {
 }
 
 function isBlankMatch(m: MatchCard | null) {
-  // a match is "blank" only if it truly doesn't exist
   return !m || !m.fixtureId;
 }
 
@@ -70,18 +69,13 @@ async function fetchBoardsOnce(): Promise<LeagueBoard[]> {
   return j.leagues as LeagueBoard[];
 }
 
-/**
- * Try until complete:
- * - Retries until blankTeams === 0
- * - Or until maxMs time budget is reached
- */
 async function fetchBoardsTryUntilComplete(opts?: {
   maxMs?: number;
   delayMs?: number;
   backoff?: boolean;
 }): Promise<{ leagues: LeagueBoard[]; tries: number; complete: boolean }> {
-  const maxMs = opts?.maxMs ?? 25_000; // up to 25s total
-  const delayMs = opts?.delayMs ?? 900; // initial delay between tries
+  const maxMs = opts?.maxMs ?? 25_000;
+  const delayMs = opts?.delayMs ?? 900;
   const backoff = opts?.backoff ?? true;
 
   const start = Date.now();
@@ -135,61 +129,44 @@ export default function Page() {
 
   useEffect(() => {
     refreshTryUntilComplete();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <main className="p-6 space-y-12">
-      <div className="space-y-2">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
-            <div className="text-sm text-gray-600">
-              CK = Corner Kicks • G = Goals • C = Cards
-            </div>
-            <div className="text-xs text-gray-500">
-              Goals: red ≤ 2, green ≥ 3 • Cards: red ≤ 4, green ≥ 5 • Corners: greener when higher
-            </div>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-3xl font-bold">Soccer Dashboard</h1>
+          <div className="text-sm text-gray-600">
+            CK = Corner Kicks • G = Goals • C = Cards
           </div>
+        </div>
 
-          <div className="flex flex-col items-end gap-2">
-            <button
-              onClick={refreshTryUntilComplete}
-              disabled={loading}
-              className={`rounded-lg px-4 py-2 text-sm font-semibold border ${
-                loading
-                  ? "bg-gray-100 text-gray-400 border-gray-200"
-                  : "bg-white hover:bg-gray-50 text-gray-900 border-gray-300"
-              }`}
-            >
-              {loading ? "Trying…" : "Refresh (Try until complete)"}
-            </button>
+        <div className="flex flex-col items-end gap-2">
+          <button
+            onClick={refreshTryUntilComplete}
+            disabled={loading}
+            className={`rounded-lg px-4 py-2 text-sm font-semibold border ${
+              loading
+                ? "bg-gray-100 text-gray-400 border-gray-200"
+                : "bg-white hover:bg-gray-50 text-gray-900 border-gray-300"
+            }`}
+          >
+            {loading ? "Trying…" : "Refresh"}
+          </button>
 
-            <div className="text-xs text-gray-500">
-              {status}
-              {blankTeams > 0 ? ` • Blank teams: ${blankTeams}` : ""}
-            </div>
+          <div className="text-xs text-gray-500">
+            {status}
+            {blankTeams > 0 ? ` • Blank teams: ${blankTeams}` : ""}
           </div>
         </div>
       </div>
 
       {leagues.map((league) => (
         <section key={league.leagueId} className="space-y-4">
-          <div className="flex items-end justify-between">
-            <h2 className="text-4xl font-bold">{league.leagueName}</h2>
-            {league.seasonUsed && (
-              <div className="text-sm text-gray-500">Season: {league.seasonUsed}</div>
-            )}
-          </div>
-
-          {league.error && (
-            <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-900">
-              {league.error}
-            </div>
-          )}
+          <h2 className="text-4xl font-bold">{league.leagueName}</h2>
 
           <div className="overflow-x-auto rounded-xl border bg-white">
-            <table className="w-full min-w-[1100px] border-collapse">
+            <table className="w-full min-w-[1100px]">
               <thead>
                 <tr className="text-left text-sm text-gray-600 border-b">
                   <th className="p-4 w-[260px]">Team</th>
@@ -202,88 +179,53 @@ export default function Page() {
               </thead>
 
               <tbody>
-                {!league.teams?.length ? (
-                  <tr>
-                    <td className="p-6 text-gray-500" colSpan={8}>
-                      No data returned for this league right now.
-                    </td>
-                  </tr>
-                ) : (
-                  league.teams.map((team) => {
-                    const slots = Array.from({ length: 7 }).map((_, i) => team.matches?.[i] ?? null);
+                {league.teams.map((team) => {
+                  const slots = Array.from({ length: 7 }).map(
+                    (_, i) => team.matches?.[i] ?? null
+                  );
 
-                    return (
-                      <tr key={team.teamId} className="border-b last:border-0">
-                        <td className="p-4 align-middle">
-                          <div className="flex items-center gap-3">
-                            <img src={team.logo} alt="" className="h-7 w-7 rounded" loading="lazy" />
-                            <div className="font-semibold text-gray-900">{team.name}</div>
-                          </div>
-                        </td>
+                  return (
+                    <tr key={team.teamId} className="border-b last:border-0">
+                      <td className="p-4">
+                        <div className="flex items-center gap-3">
+                          <img src={team.logo} className="h-7 w-7 rounded" />
+                          <div className="font-semibold">{team.name}</div>
+                        </div>
+                      </td>
 
-                        {slots.map((m, idx) => {
-                          const blank = isBlankMatch(m);
+                      {slots.map((m, idx) => {
+                        const blank = isBlankMatch(m);
 
-                          const title = blank ? "-" : `${m!.opponent} (${m!.isHome ? "H" : "A"})`;
-                          const date = blank ? "" : m!.date.slice(0, 10);
+                        const g = blank ? null : m!.goalsTotal;
+                        const ck = blank ? null : m!.cornersTotal;
+                        const c = blank ? null : m!.cardsTotal;
 
-                          // IMPORTANT: if match exists, these are ALWAYS numbers (0 allowed)
-                          const g = blank ? null : m!.goalsTotal;
-                          const ck = blank ? null : m!.cornersTotal;
-                          const c = blank ? null : m!.cardsTotal;
-
-                          return (
-                            <td key={idx} className="p-4 align-top">
-                              <div className="rounded-xl border border-red-200 bg-red-50 p-3">
-                                <div className="flex items-start justify-between gap-2">
-                                  <div className="font-semibold text-sm text-gray-900 leading-snug">
-                                    {title}
-                                  </div>
-                                  <div className="text-xs text-gray-500">{date}</div>
+                        return (
+                          <td key={idx} className="p-4">
+                            <div className="rounded-xl border p-3 bg-red-50">
+                              <div className="grid grid-cols-2 text-sm gap-y-1">
+                                <div>CK</div>
+                                <div className={ck === null ? "" : cornersClass(ck)}>
+                                  {valOrDash(ck)}
                                 </div>
 
-                                <div className="mt-3 grid grid-cols-2 gap-y-1 text-sm">
-                                  <div className="text-gray-700 font-semibold">CK</div>
-                                  <div
-                                    className={
-                                      ck === null
-                                        ? "text-gray-400 text-right"
-                                        : `${cornersClass(ck)} text-right font-semibold`
-                                    }
-                                  >
-                                    {valOrDash(ck)}
-                                  </div>
+                                <div>G</div>
+                                <div className={g === null ? "" : goalsClass(g)}>
+                                  {valOrDash(g)}
+                                </div>
 
-                                  <div className="text-gray-700 font-semibold">G</div>
-                                  <div
-                                    className={
-                                      g === null
-                                        ? "text-gray-400 text-right"
-                                        : `${goalsClass(g)} text-right font-semibold`
-                                    }
-                                  >
-                                    {valOrDash(g)}
-                                  </div>
-
-                                  <div className="text-gray-700 font-semibold">C</div>
-                                  <div
-                                    className={
-                                      c === null
-                                        ? "text-gray-400 text-right"
-                                        : `${cardsClass(c)} text-right font-semibold`
-                                    }
-                                  >
-                                    {valOrDash(c)}
-                                  </div>
+                                <div>C</div>
+                                <div className={c === null ? "" : cardsClass(c)}>
+                                  {valOrDash(c)}
                                 </div>
                               </div>
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    );
-                  })
-                )}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
