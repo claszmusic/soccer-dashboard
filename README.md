@@ -27,3 +27,4 @@ Cells show:
 2) Install & run:
    npm install
    npm run dev
+# redeploy trigger
